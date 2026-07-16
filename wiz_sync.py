@@ -269,7 +269,8 @@ CREAM = "#f3ead3"                # white script + knob pointers
 LINE = "#2a2622"
 KNOB_EDGE, KNOB_TOP, KNOB_HI = "#0e0e10", "#1d1d21", "#4a4a52"
 LAMP_OFF = "#4a1410"
-BAR_REST, IDLE_TINT = "#5c4718", "#6b5320"
+RED, RED_HI, RED_LO = "#a52a1c", "#d4553f", "#5e1509"  # tactile button face
+BAR_REST = "#5c4718"
 SCRIPT = ("Brush Script MT", 34, "bold italic")
 BADGE = ("Consolas", 8, "bold")
 KNOB_LBL = ("Arial Narrow", 9, "bold")
@@ -282,9 +283,11 @@ HEAD_W, HEAD_H = 900, 250
 
 
 class Knob:
-    """A drawn rotary control on a shared canvas. Drag up/down or wheel to turn;
-    writes through a tk var so the rest of the app reads it unchanged."""
+    """A drawn rotary control on a shared canvas. Grab and turn it like a real
+    knob; writes through a tk var so the rest of the app reads it unchanged."""
     START, SWEEP = -135.0, 270.0  # degrees clockwise from 12 o'clock
+    DEAD = 0.35   # ignore drags within this fraction of r (angle jitters at hub)
+    FINE = 0.25   # Shift-drag speed multiplier
 
     def __init__(self, canvas, cx, cy, r, label, var, lo=0.0, hi=1.0,
                  choices=None, fmt=None):
@@ -327,6 +330,11 @@ class Knob:
             x0, y0 = self._vec(f, self.r + 4)
             x1, y1 = self._vec(f, self.r + 10)
             self.c.create_line(x0, y0, x1, y1, fill=PLATE_INK, width=2)
+        if not self.choices:  # min / max printed at the ends of the scale
+            for frac, val, anc in ((0.0, self.lo, "e"), (1.0, self.hi, "w")):
+                x, y = self._vec(frac, self.r + 14)
+                self.c.create_text(x, y, text=self.fmt(val), anchor=anc,
+                                   fill=PLATE_INK, font=("Consolas", 7))
 
     def _draw_body(self):
         r, cx, cy = self.r, self.cx, self.cy
@@ -364,11 +372,25 @@ class Knob:
         else:
             self.var.set(self.lo + f * (self.hi - self.lo))
 
+    def _angle(self, e):  # degrees clockwise from 12 o'clock, matching _vec
+        return math.degrees(math.atan2(e.x - self.cx, -(e.y - self.cy)))
+
     def _press(self, e):
-        self._y0, self._f0 = e.y, self._frac()
+        self._base = self._frac()       # value locked in at grab
+        self._prev = self._angle(e)
+        self._turn = 0.0                # signed degrees turned since grab
 
     def _drag(self, e):
-        self._apply(self._f0 + (self._y0 - e.y) / 150.0)
+        a = self._angle(e)
+        step = (a - self._prev + 180) % 360 - 180  # shortest signed turn
+        self._prev = a
+        if math.hypot(e.x - self.cx, e.y - self.cy) < self.r * self.DEAD:
+            return  # dead zone: keep tracking angle, but don't turn the knob
+        if e.state & 0x0001:            # Shift held → fine adjust
+            step *= self.FINE
+        lo, hi = -self._base * self.SWEEP, (1 - self._base) * self.SWEEP
+        self._turn = min(max(self._turn + step, lo), hi)  # clamp to 270° endstops
+        self._apply(self._base + self._turn / self.SWEEP)
 
 
 class App:
@@ -386,6 +408,7 @@ class App:
         self.status_text = "Idle"
         self.mode = MODES[DEFAULT_MODE]
         self.viz_w, self.viz_h, self.top_h = 400, 120, 64
+        self._pwr_off, self._pwr_pressed = 0, False  # power-switch depth state
 
         self._setup_style()
         self.mode_name = tk.StringVar(value=DEFAULT_MODE)
@@ -409,6 +432,11 @@ class App:
                       highlightthickness=0)
         c.pack(fill="x")
         self.head = c
+        # levant-grain tolex: two sparse stipple layers over the black body
+        c.create_rectangle(0, 0, HEAD_W, HEAD_H, fill="#231f1b", stipple="gray12",
+                           outline="")                   # grain highlights
+        c.create_rectangle(0, 0, HEAD_W, HEAD_H, fill="#000000", stipple="gray25",
+                           outline="")                   # grain shadows
         c.create_rectangle(6, 6, HEAD_W - 6, HEAD_H - 6, outline=GOLD_LO,
                            width=2)                      # gold piping
         c.create_text(30, 26, text="WiZ Sync", anchor="w", fill=CREAM,
@@ -440,21 +468,27 @@ class App:
         Knob(c, xs[5], cy, r, "Flash", self.flash, 0.2, 1.5,
              fmt=lambda v: f"{v:.2f}")
 
-        # pilot jewel + power label (click to start/stop)
+        # pilot jewel = latching push-switch: sits out when off, sinks in + lights
+        # when on, with a momentary press-down on click. Cluster tagged "powerbtn"
+        # (moves together); "power" is the click target. The socket/well stays put.
         lx, ly = 826, 128
+        c.create_oval(lx - 24, ly - 22, lx + 24, ly + 26, fill="#050505",
+                      outline=GOLD_LO, width=2)          # switch well (static)
+        pb = ("power", "powerbtn")
         c.create_oval(lx - 22, ly - 22, lx + 22, ly + 22, fill=KNOB_EDGE,
-                      outline=GOLD_LO, width=2)          # chrome bezel
+                      outline=GOLD_HI, width=2, tags=pb)  # chrome bezel
         self.glow = c.create_oval(lx - 19, ly - 19, lx + 19, ly + 19,
-                                  fill=LAMP_OFF, outline="", tags="power")
+                                  fill=LAMP_OFF, outline="", tags=pb)
         self.lamp = c.create_oval(lx - 13, ly - 13, lx + 13, ly + 13,
-                                  fill=LAMP_OFF, outline="", tags="power")
+                                  fill=LAMP_OFF, outline="", tags=pb)
         c.create_oval(lx - 8, ly - 9, lx - 2, ly - 3, fill=CREAM,
-                      outline="")                        # jewel glint
-        c.create_text(lx, ly + 33, text="POWER", fill=PLATE_INK, font=KNOB_LBL)
-        self.power_txt = c.create_text(lx, ly + 47, text="START", fill=PLATE_INK,
-                                       font=("Consolas", 10, "bold"),
-                                       tags="power")
-        c.tag_bind("power", "<Button-1>", lambda e: self.toggle())
+                      outline="", tags=pb)               # jewel glint
+        c.create_text(lx, ly + 40, text="POWER", fill=PLATE_INK, font=KNOB_LBL)
+        self.power_txt = c.create_text(lx, ly + 53, text="START", fill=PLATE_INK,
+                                       font=("Consolas", 10, "bold"))
+        c.tag_bind("power", "<ButtonPress-1>", self._power_press)
+        c.tag_bind("power", "<ButtonRelease-1>", self._power_release)
+        c.tag_bind("power", "<Leave>", self._power_leave)
 
     # ---- back panel: light management + monitor
     def _build_panel(self, root):
@@ -511,11 +545,44 @@ class App:
         s.configure("Sec.TLabel", background=TOLEX, foreground=GOLD, font=FONT_SEC)
         s.configure("Status.TLabel", background=TOLEX, foreground="#9a8f76",
                     font=FONT_SM)
+        # beveled brass buttons that visibly sink when pressed
         s.configure("TButton", background=GOLD, foreground="#20160a",
-                    font=("Segoe UI", 9, "bold"), padding=(10, 6))
-        s.map("TButton", background=[("active", GOLD_HI), ("pressed", GOLD_LO)])
+                    font=("Segoe UI", 9, "bold"), padding=(10, 7),
+                    borderwidth=3, relief="raised",
+                    bordercolor=GOLD_LO, lightcolor=GOLD_HI, darkcolor=GOLD_LO)
+        s.map("TButton",
+              background=[("pressed", "#b3841f"), ("active", GOLD_HI)],
+              relief=[("pressed", "sunken"), ("!pressed", "raised")],
+              lightcolor=[("pressed", GOLD_LO)],   # flip the bevel so it looks
+              darkcolor=[("pressed", GOLD_HI)],    # pushed in, not popped out
+              foreground=[("pressed", "#000000")])
         s.configure("TEntry", fieldbackground=TOLEX2, foreground=CREAM,
                     insertcolor=CREAM, padding=6)
+
+    # ---- power switch: latch in when running, momentary depress on click
+    def _pwr_shift(self, px):
+        d = px - self._pwr_off
+        if d:
+            self.head.move("powerbtn", 0, d)
+            self._pwr_off = px
+
+    def _recompute_pwr(self):
+        running = bool(self.worker_thread and self.worker_thread.is_alive())
+        self._pwr_shift((3 if running else 0) + (3 if self._pwr_pressed else 0))
+
+    def _power_press(self, _e):
+        self._pwr_pressed = True
+        self._recompute_pwr()
+
+    def _power_release(self, _e):
+        self._pwr_pressed = False
+        self._recompute_pwr()
+        self.toggle()
+
+    def _power_leave(self, _e):
+        if self._pwr_pressed:  # dragged off before releasing — pop back, no toggle
+            self._pwr_pressed = False
+            self._recompute_pwr()
 
     def on_mode(self, *_):
         self.mode = MODES[self.mode_name.get()]
@@ -651,7 +718,6 @@ class App:
         r, g, b, _ = self.current
         running = bool(self.worker_thread and self.worker_thread.is_alive())
         color = f"#{r:02x}{g:02x}{b:02x}"
-        tint = color if max(r, g, b) > 25 else IDLE_TINT
         w, top = self.viz_w, self.top_h
 
         # pilot jewel glows the live light colour while syncing
@@ -659,6 +725,7 @@ class App:
         self.head.itemconfig(self.lamp, fill=lit)
         self.head.itemconfig(self.glow, fill=lit if running else LAMP_OFF)
         self.head.itemconfig(self.power_txt, text="STOP" if running else "START")
+        self._recompute_pwr()  # latch the switch in/out to match run state
 
         # top: scrolling loudness-envelope hills
         env = self.env_hist
@@ -667,7 +734,7 @@ class App:
         for i in range(n):
             pts += (i * w / (n - 1), top - env[i] * (top - 2))
         self.viz.coords(self.env_line, *pts)
-        self.viz.itemconfig(self.env_line, fill=tint)
+        self.viz.itemconfig(self.env_line, fill=GOLD)
 
         # beat ticks over the envelope
         self.viz.delete("beat")
@@ -682,7 +749,7 @@ class App:
             y0 = self.viz_h - float(np.clip(v, 0, 1)) * (self.viz_h - top)
             x0, _, x1, _ = self.viz.coords(bar)
             self.viz.coords(bar, x0, y0, x1, self.viz_h)
-            self.viz.itemconfig(bar, fill=tint)
+            self.viz.itemconfig(bar, fill=GOLD)
 
         self.status.config(text=self.status_text)
         self.root.after(50, self.poll)
