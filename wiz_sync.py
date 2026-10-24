@@ -20,7 +20,6 @@ LIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "lights.json")
 CHUNK = 1024  # ~21ms at 48kHz — keeps light latency low
 SEND_HZ = 15
-BEAT_SEND_GAP = 0.05  # min gap between forced on-beat sends
 
 # ---------------------------------------------------------------- WiZ (UDP)
 
@@ -429,6 +428,13 @@ class App:
         self.smooth = tk.DoubleVar(value=self.mode["smooth"])
         self.floor = tk.DoubleVar(value=self.mode["floor"])
         self.flash = tk.DoubleVar(value=self.mode["flash"])
+        # the worker reads this plain snapshot, never the tk vars: a tk call
+        # from another thread blocks until the GUI thread services it, which
+        # stalls audio reads and makes the lights lag the beat
+        for v in (self.sensitivity, self.max_bright, self.smooth, self.floor,
+                  self.flash):
+            v.trace_add("write", self._snap_params)
+        self._snap_params()
 
         self._build_head(root)
         self._build_panel(root)
@@ -596,6 +602,12 @@ class App:
             self._pwr_pressed = False
             self._recompute_pwr()
 
+    def _snap_params(self, *_):
+        self.params = dict(sensitivity=self.sensitivity.get(),
+                           smooth=self.smooth.get(), floor=self.floor.get(),
+                           flash=self.flash.get(),
+                           max_bright=self.max_bright.get())
+
     def on_mode(self, *_):
         self.mode = MODES[self.mode_name.get()]
         self.smooth.set(self.mode["smooth"])
@@ -687,19 +699,36 @@ class App:
         state = new_map_state()
         last_sent = (0, 0, 0, 0)
         last_send_t = 0.0
+        last_audio_t = time.time()
         try:
             while not self.stop_event.is_set():
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                mono = np.frombuffer(data, np.int16).reshape(-1, ch) \
-                    .mean(axis=1) / 32768.0
+                avail = stream.get_read_available()
+                if avail >= CHUNK:
+                    if avail >= 3 * CHUNK:
+                        # fell behind: drop stale audio, else every beat
+                        # lands late by the whole backlog from then on
+                        stream.read(avail - CHUNK, exception_on_overflow=False)
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    mono = np.frombuffer(data, np.int16).reshape(-1, ch) \
+                        .mean(axis=1) / 32768.0
+                    last_audio_t = time.time()
+                elif time.time() - last_audio_t > 0.1:
+                    # loopback delivers nothing while the PC is silent; feed
+                    # silence so lights settle and Stop stays responsive
+                    time.sleep(CHUNK / rate)
+                    mono = np.zeros(CHUNK)
+                else:
+                    time.sleep(0.002)
+                    continue
+                p = self.params
                 r, g, b, dim = audio_to_color(
                     mono, rate, state,
-                    sensitivity=self.sensitivity.get(),
-                    smooth=self.smooth.get(),
+                    sensitivity=p["sensitivity"],
+                    smooth=p["smooth"],
                     mode=self.mode,
-                    floor=self.floor.get(),
-                    flash=self.flash.get())
-                dim = int(dim * self.max_bright.get() / 100.0)
+                    floor=p["floor"],
+                    flash=p["flash"])
+                dim = int(dim * p["max_bright"] / 100.0)
                 self.current = (r, g, b, dim)
                 # scroll visualiser buffers (whole-array reassign = atomic read)
                 self.env_hist = np.append(self.env_hist[1:], state["env_norm"])
@@ -709,8 +738,9 @@ class App:
                 now = time.time()
                 changed = max(abs(a - b_) for a, b_ in
                               zip((r, g, b, dim), last_sent)) >= 4
-                # beats bypass the rate gate so the flash lands on time
-                due = (state["onset"] and now - last_send_t >= BEAT_SEND_GAP) \
+                # beats always go out at once, at full flash; the onset
+                # refractory (120ms) already caps them at ~8/s
+                due = state["onset"] \
                     or (now - last_send_t >= 1.0 / SEND_HZ
                         and (changed or now - last_send_t >= 1.0))
                 if due:
