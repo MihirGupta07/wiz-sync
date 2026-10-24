@@ -19,7 +19,10 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 
 WIZ_PORT = 38899
-_BASE = os.path.dirname(os.path.abspath(__file__))
+# next to the exe when frozen (sys.executable), else next to this script
+import sys
+_BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                        else os.path.abspath(__file__))
 LIGHTS_FILE = os.path.join(_BASE, "lights.json")
 CHUNK = 512  # ~11ms hop at 44.1/48kHz; the FFT window stays WIN
 SEND_HZ = 15
