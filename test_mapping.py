@@ -91,6 +91,30 @@ for i in range(120):
                    mode=MODES["Disco"])
 assert state["hue"] > 0, "Disco should advance hue on beats"
 
+# DROP: groove (kick+bass) -> bass-light build -> kick+bass slams back fires
+# exactly one drop, on the build->drop transition (not at the song's start),
+# and drop beats out-flash build beats. A live detector only knows the bass
+# ceiling once it's heard it, hence the opening groove, as in real songs.
+state = new_map_state()
+sec = int(RATE / CHUNK)
+build_at, drop_at = 12 * sec, 26 * sec
+hits, build_dims, drop_dims = [], [], []
+for i in range(drop_at + 300):
+    hit_beat = tone(55, 0.8) if i % 24 == 0 else 0
+    if build_at <= i < drop_at:
+        c = tone(400, 0.3) + (tone(55, 0.08) if i % 24 == 0 else 0)
+    else:
+        c = tone(400, 0.3) + tone(80, 0.3) + hit_beat
+    _, _, _, dim = audio_to_color(c, RATE, state, mode=MODES["Party"])
+    if state["drop_hit"]:
+        hits.append(i)
+    if state["onset"] and i >= build_at + 2 * sec:
+        (build_dims if i < drop_at else drop_dims).append(dim)
+assert len(hits) == 1 and drop_at <= hits[0] <= drop_at + 30, \
+    f"expected one drop at hop ~{drop_at}: {hits}"
+assert np.mean(drop_dims) > np.mean(build_dims) + 20, \
+    f"drop should out-flash build: {np.mean(drop_dims):.0f} vs {np.mean(build_dims):.0f}"
+
 # spectrum output is the right shape for the visualiser bars
 assert len(state["spectrum"]) == N_BARS
 

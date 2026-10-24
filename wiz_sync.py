@@ -108,8 +108,9 @@ class WizSender:
 
 N_BARS = 20  # spectrum-bar count for the visualiser
 
-# Two-layer model: COLOR follows the loudness envelope (mode-independent heat
-# gradient blue->red), BRIGHTNESS pulses on beats scaled by beat strength.
+# Two-layer model: COLOR follows the bass level (mode-independent heat
+# gradient blue->red), BRIGHTNESS pulses on beats scaled by beat strength and
+# bass level, so builds pulse softer and a DROP (bass slams back) hits hardest.
 # Modes are "feel" presets tuning the throb: `flash` scales the beat punch,
 # `smooth` sets the between-beat decay (higher = longer throb), `floor` is the
 # dim level between beats, `sens` the beat trigger ease. `color`: "gradient"
@@ -127,12 +128,20 @@ MODES = {
 DEFAULT_MODE = "Party"
 
 _BAR_EDGES = np.logspace(np.log10(30), np.log10(8000), N_BARS + 1)
-SILENCE_DB = -60.0  # below this the loudness floor isn't tracked (pauses, gaps)
+SILENCE_DB = -60.0  # below this, bass baselines aren't tracked (pauses, gaps)
+# A drop = bass jumps this far above its recent baseline, on a beat, near the
+# song's bass ceiling (BeatRunner's offline rule: energy AND low band up vs the
+# previous section). Levels: ~15 dB in builds -> ~38 dB in drops.
+DROP_JUMP_DB = 14.0   # Levels: real drops jump 15-24 dB, groove kicks 9-10
+DROP_GAP_S = 10.0     # min time between drops, and from a song's start
+DROP_HOLD_S = 4.0     # half-life of the post-drop intensity boost
 
 
 def new_map_state():
-    # db_lo starts at the top so it snaps down to the first real level
-    return {"env": 1e-6, "db_lo": 0.0, "db_hi": SILENCE_DB, "env_norm": 0.0,
+    # bass_lo starts at +inf / bass_hi at -inf so both snap to the first level
+    return {"bass": None, "bass_slow": None,
+            "bass_lo": math.inf, "bass_hi": -math.inf, "env_norm": 0.0,
+            "drop": 0.0, "drop_hit": False, "since_drop": 0.0, "quiet_t": 0.0,
             "rgb": np.zeros(3), "dim": 10.0, "onset": False, "hue": 0.0,
             "prev_chunk": np.zeros(0), "prev_kick": 0.0, "flux_hist": [],
             "flux_peak": 1e-6, "since_onset": 999,
@@ -143,10 +152,11 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
                    floor=None, flash=None):
     """Map one mono float chunk (-1..1) to (r, g, b, dimming). Mutates state.
 
-    COLOR = loudness envelope -> heat gradient (or hue cycle in Disco).
-    BRIGHTNESS = beat flash (strength-scaled) decaying to the mode's floor.
-    Sets state["onset"] on a beat, state["env_norm"]/state["spectrum"] for the
-    visualiser.
+    COLOR = bass level -> heat gradient (or hue cycle in Disco).
+    BRIGHTNESS = beat flash (strength- and bass-scaled) decaying to the floor;
+    a drop flashes white, then holds full flashes over darker gaps.
+    Sets state["onset"] on a beat, state["drop_hit"] on a drop,
+    state["env_norm"]/state["spectrum"] for the visualiser.
     """
     mode = mode or MODES[DEFAULT_MODE]
     floor = mode["floor"] if floor is None else floor
@@ -162,28 +172,40 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
     mag = np.abs(np.fft.rfft(win * np.hanning(n)))
     freqs = np.fft.rfftfreq(n, 1.0 / rate)
 
-    # ---- loudness envelope (fast attack, slow release) -> COLOR
+    dt = hop / rate
+    # loudness only gates silence (a mastered track is about as loud in the
+    # build as in the drop, so it can't drive the show). per-chunk, not
+    # smoothed: a lagging gate lets the first ~0.5s of silence drag baselines
     rms = float(np.sqrt(np.mean(mono ** 2)))
-    env = state["env"]
-    env += (0.6 if rms > env else 0.08) * (rms - env)
-    state["env"] = env
-    # normalise in dB (perceived loudness) between a tracked floor and ceiling.
-    # silence is gated out of the floor, else a track gap drags it to -120dB
-    # and all music afterwards reads near-max (red) for minutes
-    db = 20.0 * math.log10(max(env, 1e-9))
-    if db > SILENCE_DB:
-        if db < state["db_lo"]:
-            state["db_lo"] = db
+    audible = 20.0 * math.log10(max(rms, 1e-9)) > SILENCE_DB
+
+    # ---- bass level (kick band 30-150Hz, dB) -> COLOR + flash headroom.
+    # instant attack catches each kick (a gradual one would crawl up from
+    # silence through fake "quiet" levels), 0.5s release holds between them
+    kick = float(mag[(freqs >= 30) & (freqs < 150)].mean())
+    bdb = 20.0 * math.log10(kick + 1e-9)
+    if state["bass"] is None or bdb > state["bass"]:
+        state["bass"] = bdb
+    else:
+        state["bass"] += (1 - 0.5 ** (dt / 0.5)) * (bdb - state["bass"])
+    bass = state["bass"]
+    # floor + baseline skip silence, else a track gap drags them down and the
+    # next song reads as max bass (and a fake drop) for minutes
+    if audible:
+        if state["bass_slow"] is None:
+            state["bass_slow"] = bdb
+        state["bass_slow"] += (1 - 0.5 ** (dt / 4.0)) * (bass - state["bass_slow"])
+        if bass < state["bass_lo"]:
+            state["bass_lo"] = bass
         else:
-            state["db_lo"] += (db - state["db_lo"]) * 0.0005  # creep up slowly
-    state["db_hi"] = max(db, state["db_hi"] - 0.004)  # ~0.2 dB/s fall
-    rng = max(state["db_hi"] - state["db_lo"], 6.0)
-    norm = float(np.clip((db - state["db_lo"]) / rng, 0.0, 1.0))
+            state["bass_lo"] += (bass - state["bass_lo"]) * 0.0005  # creep up
+    state["bass_hi"] = max(bass, state["bass_hi"] - 0.004)  # ~0.2 dB/s fall
+    rng = max(state["bass_hi"] - state["bass_lo"], 6.0)
+    norm = float(np.clip((bass - state["bass_lo"]) / rng, 0.0, 1.0))
     state["env_norm"] = norm
 
-    # ---- beat detection: kick-band (30-150Hz) energy flux vs adaptive
+    # ---- beat detection: kick-band energy flux vs adaptive
     # threshold + refractory gap. beat strength scales the flash.
-    kick = float(mag[(freqs >= 30) & (freqs < 150)].mean())
     flux = max(0.0, kick - state["prev_kick"])
     state["prev_kick"] = kick
     hist = state["flux_hist"]
@@ -202,6 +224,20 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
     if onset:
         state["since_onset"] = 0
     state["onset"] = onset
+
+    # ---- drop: bass slams back well above its last few seconds, on a beat
+    state["quiet_t"] = 0.0 if audible else state["quiet_t"] + dt
+    # a new song (>2s silence) restarts the clock: its first kick isn't a drop
+    state["since_drop"] = 0.0 if state["quiet_t"] > 2.0 \
+        else state["since_drop"] + dt
+    state["drop"] *= 0.5 ** (dt / DROP_HOLD_S)
+    hit = (onset and audible and state["bass_slow"] is not None
+           and bass - state["bass_slow"] >= DROP_JUMP_DB
+           and norm >= 0.6 and state["since_drop"] >= DROP_GAP_S)
+    if hit:
+        state["drop"], state["since_drop"] = 1.0, 0.0
+    state["drop_hit"] = hit
+    drop = state["drop"]
 
     # ---- spectrum for the visualiser bars (log-spaced, auto-gained).
     # sum into buckets so narrow low-freq buckets with no bins read 0 (not NaN);
@@ -222,25 +258,32 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
             state["rgb"] = rgb_raw
         else:
             state["rgb"] += 0.3 * (rgb_raw - state["rgb"])
-    else:  # heat gradient: quiet=blue (hue 240) -> loud=red (hue 0)
+    else:  # heat gradient: no bass=blue (hue 240) -> full bass=red (hue 0)
         rgb_raw = np.array(colorsys.hsv_to_rgb((1 - norm) * 240 / 360, 1, 1)) * 255.0
         state["rgb"] += 0.3 * (rgb_raw - state["rgb"])
+    if hit:  # white strobe on the drop, easing back to colour in ~0.1s
+        state["rgb"] = np.full(3, 255.0)
 
-    # ---- BRIGHTNESS: beat flash decaying to the mode's floor
+    # ---- BRIGHTNESS: beat flash decaying to the floor
     # smooth -> flash half-life in seconds (30ms..600ms), so the throb is
     # independent of hop size and long enough for bulbs fed at SEND_HZ to show
     smooth = min(max(smooth, 0.0), 0.95)
     half_life = 0.03 + 0.6 * smooth
-    decay = 1.0 - 0.5 ** ((hop / rate) / half_life)
+    decay = 1.0 - 0.5 ** (dt / half_life)
+    # after a drop the gaps go darker, so the full-bright hits contrast more
+    floor_now = floor * (1.0 - 0.7 * drop)
     if onset:
         # a detected beat already cleared the adaptive threshold, so it always
-        # pops; strength only modulates the top half (soft beat 50% -> hard 100%)
+        # pops; strength modulates the top half (soft beat 50% -> hard 100%) and
+        # bass level sets the headroom (bass-less build ~35% -> drop 100%)
         strength = float(np.clip(flux / max(state["flux_peak"], 1e-6), 0.0, 1.0))
-        level = floor + (100.0 - floor) * flash * (0.5 + 0.5 * strength)
+        headroom = max(drop, 0.35 + 0.65 * norm)
+        level = 100.0 if hit else floor_now + (100.0 - floor_now) * flash \
+            * (0.5 + 0.5 * strength) * headroom
         state["dim"] = min(100.0, max(state["dim"], level))
     else:
-        state["dim"] += decay * (floor - state["dim"])
-    state["dim"] = float(np.clip(state["dim"], floor, 100.0))
+        state["dim"] += decay * (floor_now - state["dim"])
+    state["dim"] = float(np.clip(state["dim"], floor_now, 100.0))
 
     r, g, b = np.clip(state["rgb"], 0, 255)
     return int(r), int(g), int(b), int(state["dim"])
@@ -413,7 +456,7 @@ class App:
         self.stop_event = threading.Event()
         self.worker_thread = None
         self.current = (0, 0, 0, 10)  # last computed color, read by GUI poll
-        self.env_hist = np.zeros(140)  # scrolling loudness envelope (0..1)
+        self.env_hist = np.zeros(140)  # scrolling bass level (0..1)
         self.beat_hist = np.zeros(140)  # 1.0 where a beat fired, else 0
         self.spectrum = np.zeros(N_BARS)  # latest spectrum bars (0..1)
         self.status_text = "Idle"
@@ -769,7 +812,7 @@ class App:
         self.head.itemconfig(self.power_txt, text="STOP" if running else "START")
         self._recompute_pwr()  # latch the switch in/out to match run state
 
-        # top: scrolling loudness-envelope hills
+        # top: scrolling bass-level hills (what drives the colour)
         env = self.env_hist
         n = len(env)
         pts = []
