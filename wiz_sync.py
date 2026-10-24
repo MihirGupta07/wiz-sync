@@ -128,17 +128,19 @@ MODES = {
 DEFAULT_MODE = "Party"
 
 _BAR_EDGES = np.logspace(np.log10(30), np.log10(8000), N_BARS + 1)
+SILENCE_DB = -60.0  # below this the loudness floor isn't tracked (pauses, gaps)
 
 
 def new_map_state():
-    return {"env": 1e-6, "env_min": 1e-6, "env_max": 1e-3, "env_norm": 0.0,
+    # db_lo starts at the top so it snaps down to the first real level
+    return {"env": 1e-6, "db_lo": 0.0, "db_hi": SILENCE_DB, "env_norm": 0.0,
             "rgb": np.zeros(3), "dim": 10.0, "onset": False, "hue": 0.0,
             "prev_chunk": np.zeros(0), "prev_kick": 0.0, "flux_hist": [],
             "flux_peak": 1e-6, "since_onset": 999,
             "spec_peak": np.full(N_BARS, 1e-6), "spectrum": np.zeros(N_BARS)}
 
 
-def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=0.6, mode=None,
+def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
                    floor=None, flash=None):
     """Map one mono float chunk (-1..1) to (r, g, b, dimming). Mutates state.
 
@@ -150,6 +152,7 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=0.6, mode=None,
     mode = mode or MODES[DEFAULT_MODE]
     floor = mode["floor"] if floor is None else floor
     flash = mode["flash"] if flash is None else flash
+    smooth = mode["smooth"] if smooth is None else smooth
     hop = len(mono)
     # widen the analysis window to 2 hops (~43ms) for finer low-freq resolution
     # while still updating every hop; the kick band gets ~2x the bins
@@ -165,13 +168,18 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=0.6, mode=None,
     env = state["env"]
     env += (0.6 if rms > env else 0.08) * (rms - env)
     state["env"] = env
-    if env < state["env_min"]:
-        state["env_min"] = env
-    else:
-        state["env_min"] += (env - state["env_min"]) * 0.0005  # creep up slowly
-    state["env_max"] = max(env, state["env_max"] * 0.9995)
-    rng = max(state["env_max"] - state["env_min"], 1e-4)
-    norm = float(np.clip((env - state["env_min"]) / rng, 0.0, 1.0))
+    # normalise in dB (perceived loudness) between a tracked floor and ceiling.
+    # silence is gated out of the floor, else a track gap drags it to -120dB
+    # and all music afterwards reads near-max (red) for minutes
+    db = 20.0 * math.log10(max(env, 1e-9))
+    if db > SILENCE_DB:
+        if db < state["db_lo"]:
+            state["db_lo"] = db
+        else:
+            state["db_lo"] += (db - state["db_lo"]) * 0.0005  # creep up slowly
+    state["db_hi"] = max(db, state["db_hi"] - 0.004)  # ~0.2 dB/s fall
+    rng = max(state["db_hi"] - state["db_lo"], 6.0)
+    norm = float(np.clip((db - state["db_lo"]) / rng, 0.0, 1.0))
     state["env_norm"] = norm
 
     # ---- beat detection: kick-band (30-150Hz) energy flux vs adaptive
@@ -180,17 +188,18 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=0.6, mode=None,
     flux = max(0.0, kick - state["prev_kick"])
     state["prev_kick"] = kick
     hist = state["flux_hist"]
-    hist.append(flux)
-    if len(hist) > max(20, int(rate / hop)):
-        hist.pop(0)
     state["flux_peak"] = max(flux, state["flux_peak"] * 0.995, 1e-6)
     state["since_onset"] += 1
     k = float(np.clip(2.0 / max(sensitivity, 0.1), 0.5, 4.0))  # lower k = easier
     refractory = max(1, int(0.12 * rate / hop))
+    # threshold from past frames only — a spike mustn't raise its own bar
     onset = (len(hist) > 10
              and flux > np.mean(hist) + k * np.std(hist)
              and flux > state["flux_peak"] * 0.1
              and state["since_onset"] >= refractory)
+    hist.append(flux)
+    if len(hist) > max(20, int(rate / hop)):
+        hist.pop(0)
     if onset:
         state["since_onset"] = 0
     state["onset"] = onset
@@ -219,8 +228,11 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=0.6, mode=None,
         state["rgb"] += 0.3 * (rgb_raw - state["rgb"])
 
     # ---- BRIGHTNESS: beat flash decaying to the mode's floor
+    # smooth -> flash half-life in seconds (30ms..600ms), so the throb is
+    # independent of hop size and long enough for bulbs fed at SEND_HZ to show
     smooth = min(max(smooth, 0.0), 0.95)
-    decay = 1.0 - smooth
+    half_life = 0.03 + 0.6 * smooth
+    decay = 1.0 - 0.5 ** ((hop / rate) / half_life)
     if onset:
         # a detected beat already cleared the adaptive threshold, so it always
         # pops; strength only modulates the top half (soft beat 50% -> hard 100%)

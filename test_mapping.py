@@ -19,6 +19,34 @@ for _ in range(300):
     r, g, b, _ = audio_to_color(tone(440, 0.02), RATE, state, mode=MODES["Pop"])
 assert b > r, f"quiet audio should be cool (blue>red): {(r, g, b)}"
 
+# a silent gap between tracks must not drag the loudness floor down — quiet
+# music afterwards should still read cool, not pinned warm
+for _ in range(500):
+    audio_to_color(np.zeros(CHUNK), RATE, state, mode=MODES["Pop"])
+for _ in range(80):
+    audio_to_color(tone(440, 0.8), RATE, state, mode=MODES["Pop"])
+for _ in range(60):
+    r, g, b, _ = audio_to_color(tone(440, 0.02), RATE, state, mode=MODES["Pop"])
+assert b > r, f"quiet after a silent gap should be cool: {(r, g, b)}"
+
+
+# SMOOTH sets how long the flash throbs: Jazz should glow far longer than Rave
+def throb_hops(name):
+    st = new_map_state()
+    m = MODES[name]
+    for i in range(48):  # one kick at hop 24 over quiet
+        _, _, _, dim = audio_to_color(tone(55, 0.8) if i == 24 else tone(60, 0.03),
+                                      RATE, st, mode=m)
+    n = 0
+    while dim > m["floor"] + 10 and n < 200:
+        _, _, _, dim = audio_to_color(tone(60, 0.03), RATE, st, mode=m)
+        n += 1
+    return n
+
+
+rave, jazz = throb_hops("Rave"), throb_hops("Jazz")
+assert jazz > 3 * max(rave, 1), f"Smooth should lengthen the throb: {rave} vs {jazz}"
+
 # BRIGHTNESS preserves beat dynamics: a hard kick flashes brighter than a soft
 # one (the original ". - . -" complaint). Alternate strong/weak kicks.
 state = new_map_state()
