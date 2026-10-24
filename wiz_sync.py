@@ -8,7 +8,9 @@ import json
 import logging
 import math
 import os
+import shutil
 import socket
+import sys
 import threading
 from collections import deque
 import time
@@ -18,11 +20,20 @@ from tkinter import ttk
 import numpy as np
 import pyaudiowpatch as pyaudio
 
+__version__ = "1.0.0"
 WIZ_PORT = 38899
-# next to the exe when frozen (sys.executable), else next to this script
-import sys
-_BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                        else os.path.abspath(__file__))
+# saved lights + debug log: next to the script when run from source; when
+# installed, in %LOCALAPPDATA%\WiZ Sync (the install folder may be read-only)
+if getattr(sys, "frozen", False):
+    _BASE = os.path.join(os.environ.get("LOCALAPPDATA")
+                         or os.path.expanduser("~"), "WiZ Sync")
+    os.makedirs(_BASE, exist_ok=True)
+    _old = os.path.join(os.path.dirname(sys.executable), "lights.json")
+    if os.path.exists(_old) and not os.path.exists(
+            os.path.join(_BASE, "lights.json")):  # carry over pre-1.0 saves
+        shutil.copy(_old, _BASE)
+else:
+    _BASE = os.path.dirname(os.path.abspath(__file__))
 LIGHTS_FILE = os.path.join(_BASE, "lights.json")
 CHUNK = 512  # ~11ms hop at 44.1/48kHz; the FFT window stays WIN
 SEND_HZ = 15
@@ -646,6 +657,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("WiZ Sync")
+        ico = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(
+            os.path.abspath(__file__))), "wiz-sync.ico")
+        if os.path.exists(ico):
+            root.iconbitmap(ico)
         root.configure(bg=TOLEX)
         root.resizable(False, False)
         self.stop_event = threading.Event()
@@ -1078,6 +1093,7 @@ class App:
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="WiZ Sync")
+    ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("--debug", action="store_true",
                     help="log beats/drops/near-misses to wiz_sync_debug.log")
     ap.add_argument("--replay", metavar="AUDIO",
