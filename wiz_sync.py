@@ -3,11 +3,14 @@
 Run: python wiz_sync.py
 """
 import colorsys
+import functools
 import json
+import logging
 import math
 import os
 import socket
 import threading
+from collections import deque
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -16,9 +19,9 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 
 WIZ_PORT = 38899
-LIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "lights.json")
-CHUNK = 1024  # ~21ms at 48kHz — keeps light latency low
+_BASE = os.path.dirname(os.path.abspath(__file__))
+LIGHTS_FILE = os.path.join(_BASE, "lights.json")
+CHUNK = 512  # ~11ms hop at 44.1/48kHz; the FFT window stays WIN
 SEND_HZ = 15
 
 # ---------------------------------------------------------------- WiZ (UDP)
@@ -109,8 +112,10 @@ class WizSender:
 N_BARS = 20  # spectrum-bar count for the visualiser
 
 # Two-layer model: COLOR follows the bass level (mode-independent heat
-# gradient blue->red), BRIGHTNESS pulses on beats scaled by beat strength and
+# gradient blue->red), BRIGHTNESS pulses on kicks scaled by beat strength and
 # bass level, so builds pulse softer and a DROP (bass slams back) hits hardest.
+# On top sit DJ-style section effects: builds whiten and pulse on snare rolls,
+# the gap a build cuts to goes dark, and a drop lands as a held white impact.
 # Modes are "feel" presets tuning the throb: `flash` scales the beat punch,
 # `smooth` sets the between-beat decay (higher = longer throb), `floor` is the
 # dim level between beats, `sens` the beat trigger ease. `color`: "gradient"
@@ -127,24 +132,88 @@ MODES = {
 }
 DEFAULT_MODE = "Party"
 
+WIN = 2048  # FFT window: ~21 Hz bins (5-6 in the kick band) at 44.1/48 kHz
+_HANN = np.hanning(WIN)
 _BAR_EDGES = np.logspace(np.log10(30), np.log10(8000), N_BARS + 1)
-SILENCE_DB = -60.0  # below this, bass baselines aren't tracked (pauses, gaps)
-# A drop = bass jumps this far above its recent baseline, on a beat, near the
-# song's bass ceiling (BeatRunner's offline rule: energy AND low band up vs the
-# previous section). Levels: ~15 dB in builds -> ~38 dB in drops.
-DROP_JUMP_DB = 14.0   # Levels: real drops jump 15-24 dB, groove kicks 9-10
-DROP_GAP_S = 10.0     # min time between drops, and from a song's start
-DROP_HOLD_S = 4.0     # half-life of the post-drop intensity boost
+SILENCE_DB = -60.0  # below this nothing feeds the adaptive baselines
+
+# ---- tuning. times in seconds, levels in dB. `python wiz_sync.py --replay
+# song.mp3` prints every beat/drop/near-miss with these numbers to tune by.
+KICK_HZ = (30.0, 150.0)      # kick + bass band
+SNARE_HZ = (150.0, 8000.0)   # broadband transients: snares, claps, rolls
+FLUX_LAG = 2                 # flux vs the window 2 hops back (windows overlap)
+ONSET_HIST_S = 1.5           # adaptive-threshold history
+ONSET_RISE_S = 0.05          # flash may keep rising this long after a kick
+KICK_GAP_S = 0.2            # kick refractory: kills double triggers, keeps
+                             # half-beat bass pumps (no tempo grid)
+SNARE_GAP_S = 0.06
+DROP_HIST_S = 8.0            # bass/energy history a drop is measured against
+DROP_RECENT_S = 1.0          # newest span kept out of that baseline
+DROP_BASS_DB = 12.0          # bass rise over baseline that scores full
+DROP_ENERGY_DB = 6.0         # broadband rise over baseline that scores full
+DROP_MIN_BASS = 0.6          # gate: bass score needed (~7 dB) - energy alone
+                             # (risers, snare rolls) never makes a drop
+DROP_SCORE = 0.6             # trigger: 0.6*bass + 0.4*energy + 0.2*rhythm
+DROP_CONFIRM_S = 0.15        # score held this long with no kick -> fire anyway
+DROP_GAP_S = 10.0            # min time between drops, and from a song's start
+DROP_HOLD_S = 4.0            # half-life of the post-drop punch boost
+IMPACT_HOLD_S = 0.30         # white impact held so slow-fading bulbs show it
+BUILD_RAMP_S = 8.0           # build tension ramps 0->1 over this
+BLACKOUT = True              # go dark in the gap a build cuts to before a drop
+BLACKOUT_DB = 12.0           # energy dip below its recent level = that gap
+                             # (riser pauses dip ~8 dB; a real cut-out more)
+BLACKOUT_MAX_S = 1.0         # release the blackout if no drop follows
+
+log = logging.getLogger("wiz_sync")
+
+
+@functools.lru_cache(maxsize=4)
+def _bands(rate):
+    """Bin masks + visualiser bucket map for one sample rate (cached)."""
+    f = np.fft.rfftfreq(WIN, 1.0 / rate)
+    # only bins inside [30,8000) feed the bars so DC and >8kHz don't pile up
+    in_bars = (f >= _BAR_EDGES[0]) & (f < _BAR_EDGES[-1])
+    return {"kick": (f >= KICK_HZ[0]) & (f < KICK_HZ[1]),
+            "snare": (f >= SNARE_HZ[0]) & (f < SNARE_HZ[1]),
+            "energy": (f >= 30) & (f < 16000), "bars": in_bars,
+            "bar_idx": np.searchsorted(_BAR_EDGES, f[in_bars], side="right") - 1}
+
+
+def _detector(n_hist):
+    return {"hist": deque(maxlen=n_hist), "peak": 1e-6, "since": math.inf}
+
+
+def _detect(d, flux, k, gap_hops, peak_decay, abs_floor=0.05):
+    """Adaptive onset: flux above median + k robust sigmas (MAD) of the recent
+    past, which the beats themselves barely move. Returns strength 0..1 vs the
+    peak *before* this frame (so a new loudest beat reads 1.0), or None."""
+    d["since"] += 1
+    hit = None
+    if len(d["hist"]) >= 10:
+        h = np.fromiter(d["hist"], float)
+        med = float(np.median(h))
+        sigma = 1.4826 * float(np.median(np.abs(h - med))) + 1e-6
+        if (flux > med + k * sigma and flux > abs_floor
+                and flux > 0.1 * d["peak"] and d["since"] >= gap_hops):
+            hit = float(np.clip(flux / d["peak"], 0.0, 1.0))
+            d["since"] = 0
+    d["peak"] = max(flux, d["peak"] * peak_decay, 1e-6)
+    d["hist"].append(flux)
+    return hit
 
 
 def new_map_state():
-    # bass_lo starts at +inf / bass_hi at -inf so both snap to the first level
-    return {"bass": None, "bass_slow": None,
-            "bass_lo": math.inf, "bass_hi": -math.inf, "env_norm": 0.0,
-            "drop": 0.0, "drop_hit": False, "since_drop": 0.0, "quiet_t": 0.0,
-            "rgb": np.zeros(3), "dim": 10.0, "onset": False, "hue": 0.0,
-            "prev_chunk": np.zeros(0), "prev_kick": 0.0, "flux_hist": [],
-            "flux_peak": 1e-6, "since_onset": 999,
+    return {"t": 0.0, "buf": np.zeros(WIN), "logs": deque(maxlen=FLUX_LAG + 1),
+            "kick": None, "snare": None, "kicks": deque(), "snares": deque(),
+            "hist_bass": None, "hist_energy": None,  # sized on first chunk
+            # bass_lo starts at +inf / bass_hi at -inf so both snap to level 1
+            "bass": None, "bass_lo": math.inf, "bass_hi": -math.inf,
+            "bass_p": None, "energy_p": None, "energy_hi": -math.inf,
+            "env_norm": 0.0, "drop": 0.0, "drop_hit": False, "drop_score": 0.0,
+            "since_drop": 0.0, "quiet_t": 0.0, "confirm_t": 0.0, "miss_t": 0.0,
+            "tension": 0.0, "blackout_t": None, "blackout_e": 0.0, "impact_until": -math.inf,
+            "event": None, "onset": False, "kick_t": -math.inf, "kick_s": 0.0,
+            "rgb": np.zeros(3), "dim": 10.0, "hue": 0.0,
             "spec_peak": np.full(N_BARS, 1e-6), "spectrum": np.zeros(N_BARS)}
 
 
@@ -152,104 +221,186 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
                    floor=None, flash=None):
     """Map one mono float chunk (-1..1) to (r, g, b, dimming). Mutates state.
 
-    COLOR = bass level -> heat gradient (or hue cycle in Disco).
-    BRIGHTNESS = beat flash (strength- and bass-scaled) decaying to the floor;
-    a drop flashes white, then holds full flashes over darker gaps.
-    Sets state["onset"] on a beat, state["drop_hit"] on a drop,
-    state["env_norm"]/state["spectrum"] for the visualiser.
+    COLOR = bass level -> heat gradient (or hue cycle in Disco), whitened by
+    build tension. BRIGHTNESS = kick flash (strength- and bass-scaled) decaying
+    to the floor; snare pulses during builds; dark in a pre-drop gap; a held
+    white impact on the drop, then full flashes over darker gaps.
+    Sets state["event"] ("drop" | "beat" | None) for send priority,
+    state["onset"]/["drop_hit"], and env_norm/spectrum for the visualiser.
     """
     mode = mode or MODES[DEFAULT_MODE]
     floor = mode["floor"] if floor is None else floor
     flash = mode["flash"] if flash is None else flash
     smooth = mode["smooth"] if smooth is None else smooth
     hop = len(mono)
-    # widen the analysis window to 2 hops (~43ms) for finer low-freq resolution
-    # while still updating every hop; the kick band gets ~2x the bins
-    prev = state["prev_chunk"]
-    win = np.concatenate([prev, mono]) if len(prev) == hop else mono
-    state["prev_chunk"] = mono
-    n = len(win)
-    mag = np.abs(np.fft.rfft(win * np.hanning(n)))
-    freqs = np.fft.rfftfreq(n, 1.0 / rate)
-
     dt = hop / rate
+    state["t"] += dt
+    t = state["t"]
+    b = _bands(rate)
+    if state["kick"] is None:
+        n = max(10, int(ONSET_HIST_S / dt))
+        state["kick"], state["snare"] = _detector(n), _detector(n)
+        state["hist_bass"] = deque(maxlen=int(DROP_HIST_S / dt))
+        state["hist_energy"] = deque(maxlen=int(DROP_HIST_S / dt))
+
+    # slide a fixed WIN window by each hop: fine low-freq resolution at any hop
+    buf = np.concatenate([state["buf"], mono])[-WIN:]
+    state["buf"] = buf
+    mag = np.abs(np.fft.rfft(buf * _HANN)) * (4.0 / WIN)  # ~= sine amplitude
+
     # loudness only gates silence (a mastered track is about as loud in the
     # build as in the drop, so it can't drive the show). per-chunk, not
     # smoothed: a lagging gate lets the first ~0.5s of silence drag baselines
     rms = float(np.sqrt(np.mean(mono ** 2)))
     audible = 20.0 * math.log10(max(rms, 1e-9)) > SILENCE_DB
+    state["quiet_t"] = 0.0 if audible else state["quiet_t"] + dt
 
-    # ---- bass level (kick band 30-150Hz, dB) -> COLOR + flash headroom.
-    # instant attack catches each kick (a gradual one would crawl up from
-    # silence through fake "quiet" levels), 0.5s release holds between them
-    kick = float(mag[(freqs >= 30) & (freqs < 150)].mean())
-    bdb = 20.0 * math.log10(kick + 1e-9)
+    # ---- onsets: log-magnitude spectral flux, half-wave rectified per bin
+    # (a rising bin can't be cancelled by a falling one), robust threshold
+    logm = np.log1p(100.0 * mag)
+    logs = state["logs"]
+    prev = logs[0] if len(logs) == logs.maxlen else None
+    logs.append(logm)
+    kick_flux = snare_flux = 0.0
+    if prev is not None:
+        rise = np.maximum(logm - prev, 0.0)
+        kick_flux = float(rise[b["kick"]].mean())
+        snare_flux = float(rise[b["snare"]].mean())
+    k = float(np.clip(4.0 / max(sensitivity, 0.1), 1.5, 10.0))  # lower = easier
+    peak_decay = 0.5 ** (dt / 3.0)
+    kick_s = _detect(state["kick"], kick_flux, k, KICK_GAP_S / dt, peak_decay)
+    snare_s = _detect(state["snare"], snare_flux, k, SNARE_GAP_S / dt,
+                      peak_decay)
+    onset = kick_s is not None
+    kicks, snares = state["kicks"], state["snares"]
+    if onset:
+        kicks.append(t)
+        state["kick_t"], state["kick_s"] = t, kick_s
+    if snare_s is not None:
+        snares.append(t)
+    for q in (kicks, snares):
+        while q and q[0] < t - 2.0:
+            q.popleft()
+    kick_rate, snare_rate = len(kicks) / 2.0, len(snares) / 2.0
+
+    # ---- bass level (peak-hold, dB) -> COLOR + flash headroom. instant
+    # attack catches each kick (a gradual one would crawl up from silence
+    # through fake "quiet" levels), 0.5s release holds between them
+    bass_pow = float(np.mean(mag[b["kick"]] ** 2))
+    energy_pow = float(np.sum(mag[b["energy"]] ** 2))
+    bdb = 10.0 * math.log10(bass_pow + 1e-12)
     if state["bass"] is None or bdb > state["bass"]:
         state["bass"] = bdb
     else:
         state["bass"] += (1 - 0.5 ** (dt / 0.5)) * (bdb - state["bass"])
     bass = state["bass"]
-    # floor + baseline skip silence, else a track gap drags them down and the
-    # next song reads as max bass (and a fake drop) for minutes
+    # floor/ceiling skip silence, else a track gap drags them down and the
+    # next song reads as max bass for minutes
     if audible:
-        if state["bass_slow"] is None:
-            state["bass_slow"] = bdb
-        state["bass_slow"] += (1 - 0.5 ** (dt / 4.0)) * (bass - state["bass_slow"])
         if bass < state["bass_lo"]:
             state["bass_lo"] = bass
         else:
-            state["bass_lo"] += (bass - state["bass_lo"]) * 0.0005  # creep up
-    state["bass_hi"] = max(bass, state["bass_hi"] - 0.004)  # ~0.2 dB/s fall
+            state["bass_lo"] += (bass - state["bass_lo"]) * dt / 40.0  # creep
+    state["bass_hi"] = max(bass, state["bass_hi"] - 0.2 * dt)  # 0.2 dB/s fall
     rng = max(state["bass_hi"] - state["bass_lo"], 6.0)
     norm = float(np.clip((bass - state["bass_lo"]) / rng, 0.0, 1.0))
     state["env_norm"] = norm
 
-    # ---- beat detection: kick-band energy flux vs adaptive
-    # threshold + refractory gap. beat strength scales the flash.
-    flux = max(0.0, kick - state["prev_kick"])
-    state["prev_kick"] = kick
-    hist = state["flux_hist"]
-    state["flux_peak"] = max(flux, state["flux_peak"] * 0.995, 1e-6)
-    state["since_onset"] += 1
-    k = float(np.clip(2.0 / max(sensitivity, 0.1), 0.5, 4.0))  # lower k = easier
-    refractory = max(1, int(0.12 * rate / hop))
-    # threshold from past frames only — a spike mustn't raise its own bar
-    onset = (len(hist) > 10
-             and flux > np.mean(hist) + k * np.std(hist)
-             and flux > state["flux_peak"] * 0.1
-             and state["since_onset"] >= refractory)
-    hist.append(flux)
-    if len(hist) > max(20, int(rate / hop)):
-        hist.pop(0)
-    if onset:
-        state["since_onset"] = 0
-    state["onset"] = onset
+    # ---- section level: 0.2s-smoothed bass + broadband energy vs the last
+    # DROP_HIST_S (newest second excluded, 25th pct so kicks don't lift it)
+    a = 1 - 0.5 ** (dt / 0.2)
+    for key, pw in (("bass_p", bass_pow), ("energy_p", energy_pow)):
+        state[key] = pw if state[key] is None else state[key] + a * (pw - state[key])
+    bass_db = 10.0 * math.log10(state["bass_p"] + 1e-12)
+    energy_db = 10.0 * math.log10(state["energy_p"] + 1e-12)
+    inst_energy_db = 10.0 * math.log10(energy_pow + 1e-12)
+    hb, he = state["hist_bass"], state["hist_energy"]
+    if audible:
+        hb.append(bass_db)
+        he.append(energy_db)
+        state["energy_hi"] = max(energy_db, state["energy_hi"] - 0.2 * dt)
+    recent = int(DROP_RECENT_S / dt)
+    d_bass = d_energy = s_bass = score = 0.0
+    if len(hb) > recent + int(2.0 / dt):  # need 2s+ of audible baseline
+        base_b = float(np.percentile(np.fromiter(hb, float)[:-recent], 25))
+        base_e = float(np.percentile(np.fromiter(he, float)[:-recent], 25))
+        d_bass, d_energy = bass_db - base_b, energy_db - base_e
+        s_bass = float(np.clip(d_bass / DROP_BASS_DB, 0.0, 1.0))
+        s_energy = float(np.clip(d_energy / DROP_ENERGY_DB, 0.0, 1.0))
+        s_rhythm = float(np.clip(max(kick_rate, 0.5 * snare_rate) / 1.5, 0, 1))
+        score = 0.6 * s_bass + 0.4 * s_energy + 0.2 * s_rhythm
+    state["drop_score"] = score
 
-    # ---- drop: bass slams back well above its last few seconds, on a beat
-    state["quiet_t"] = 0.0 if audible else state["quiet_t"] + dt
+    # ---- DROP: bass (+ energy, rhythm) jumps over the recent section. fires
+    # on a kick, or after DROP_CONFIRM_S if the kick detector missed it
     # a new song (>2s silence) restarts the clock: its first kick isn't a drop
     state["since_drop"] = 0.0 if state["quiet_t"] > 2.0 \
         else state["since_drop"] + dt
     state["drop"] *= 0.5 ** (dt / DROP_HOLD_S)
-    hit = (onset and audible and state["bass_slow"] is not None
-           and bass - state["bass_slow"] >= DROP_JUMP_DB
-           and norm >= 0.6 and state["since_drop"] >= DROP_GAP_S)
+    armed = (audible and s_bass >= DROP_MIN_BASS and norm >= 0.6
+             and score >= DROP_SCORE and state["since_drop"] >= DROP_GAP_S)
+    state["confirm_t"] = state["confirm_t"] + dt if armed else 0.0
+    hit = armed and (onset or state["confirm_t"] >= DROP_CONFIRM_S)
+
+    # ---- BUILD tension: bass well under the song's ceiling while the mix
+    # stays full and rhythmic (snare roll, synth riser) -> ramps up
+    bass_mid_norm = (bass_db - state["bass_lo"]) / rng
+    building = (audible and bass_mid_norm < 0.45
+                and energy_db > state["energy_hi"] - 8.0
+                and (snare_rate >= 1.0 or kick_rate >= 1.0))
+    if building:
+        state["tension"] = min(1.0, state["tension"] + dt / BUILD_RAMP_S)
+    else:
+        state["tension"] *= 0.5 ** (dt / 1.0)
+    tension = state["tension"]
+
+    # ---- BLACKOUT: a built-up mix suddenly cutting out = the pre-drop gap
+    if (BLACKOUT and state["blackout_t"] is None and tension >= 0.4
+            and inst_energy_db < energy_db - BLACKOUT_DB):
+        state["blackout_t"], state["blackout_e"] = t, energy_db
+        log.debug("%8.3f blackout tension=%.2f dip=%.1fdB", t, tension,
+                  energy_db - inst_energy_db)
+    # released by the drop, by the music coming back without one, or timeout
+    if state["blackout_t"] is not None and (
+            hit or t - state["blackout_t"] > BLACKOUT_MAX_S
+            or inst_energy_db > state["blackout_e"] - 3.0):
+        state["blackout_t"] = None
+    blackout = state["blackout_t"] is not None
+
     if hit:
-        state["drop"], state["since_drop"] = 1.0, 0.0
-    state["drop_hit"] = hit
+        state.update(drop=1.0, since_drop=0.0, confirm_t=0.0, tension=0.0,
+                     impact_until=t + IMPACT_HOLD_S)
+    state["onset"], state["drop_hit"] = onset, hit
+    state["event"] = "drop" if hit else ("beat" if onset else None)
     drop = state["drop"]
 
+    if log.isEnabledFor(logging.DEBUG):
+        if hit:
+            log.debug("%8.3f DROP via=%s score=%.2f bass=%.1fdB dBass=%+.1f "
+                      "dEnergy=%+.1f kicks/s=%.1f", t,
+                      "kick" if onset else "confirm", score, bass_db, d_bass,
+                      d_energy, kick_rate)
+        elif score >= 0.45 and t - state["miss_t"] >= 0.5:
+            state["miss_t"] = t
+            why = ("gap" if state["since_drop"] < DROP_GAP_S else
+                   "bass<min" if s_bass < DROP_MIN_BASS else
+                   "ceiling" if norm < 0.6 else
+                   "score" if score < DROP_SCORE else "waiting")
+            log.debug("%8.3f near-miss(%s) score=%.2f dBass=%+.1f dEnergy=%+.1f",
+                      t, why, score, d_bass, d_energy)
+        if onset:
+            log.debug("%8.3f beat strength=%.2f bass=%.2f score=%.2f "
+                      "tension=%.2f", t, kick_s, norm, score, tension)
+
     # ---- spectrum for the visualiser bars (log-spaced, auto-gained).
-    # sum into buckets so narrow low-freq buckets with no bins read 0 (not NaN);
-    # only bins inside [30,8000) count so DC and >8kHz don't pile on the edges
-    in_range = (freqs >= _BAR_EDGES[0]) & (freqs < _BAR_EDGES[-1])
-    idx = np.searchsorted(_BAR_EDGES, freqs[in_range], side="right") - 1
+    # sum into buckets so narrow low-freq buckets with no bins read 0 (not NaN)
     spec = np.zeros(N_BARS)
-    np.add.at(spec, idx, mag[in_range])
-    state["spec_peak"] = np.maximum(spec, state["spec_peak"] * 0.99)
+    np.add.at(spec, b["bar_idx"], mag[b["bars"]])
+    state["spec_peak"] = np.maximum(spec, state["spec_peak"] * 0.5 ** (dt / 1.5))
     state["spectrum"] = spec / np.maximum(state["spec_peak"], 1e-6)
 
     # ---- COLOR
+    ease = 1 - 0.5 ** (dt / 0.04)  # ~40ms colour glide
     if mode["color"] == "cycle":
         if onset:
             state["hue"] = (state["hue"] + mode["jump"]) % 360.0
@@ -257,12 +408,17 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
         if onset:  # snap on beat
             state["rgb"] = rgb_raw
         else:
-            state["rgb"] += 0.3 * (rgb_raw - state["rgb"])
+            state["rgb"] += ease * (rgb_raw - state["rgb"])
     else:  # heat gradient: no bass=blue (hue 240) -> full bass=red (hue 0)
         rgb_raw = np.array(colorsys.hsv_to_rgb((1 - norm) * 240 / 360, 1, 1)) * 255.0
-        state["rgb"] += 0.3 * (rgb_raw - state["rgb"])
-    if hit:  # white strobe on the drop, easing back to colour in ~0.1s
+        state["rgb"] += ease * (rgb_raw - state["rgb"])
+    if hit:  # white impact, easing back to colour once the hold ends
         state["rgb"] = np.full(3, 255.0)
+    rgb = state["rgb"]
+    if t < state["impact_until"]:
+        rgb = np.full(3, 255.0)
+    elif tension > 0:  # builds wash toward white
+        rgb = rgb + 0.6 * tension * (255.0 - rgb)
 
     # ---- BRIGHTNESS: beat flash decaying to the floor
     # smooth -> flash half-life in seconds (30ms..600ms), so the throb is
@@ -270,23 +426,59 @@ def audio_to_color(mono, rate, state, sensitivity=1.0, smooth=None, mode=None,
     smooth = min(max(smooth, 0.0), 0.95)
     half_life = 0.03 + 0.6 * smooth
     decay = 1.0 - 0.5 ** (dt / half_life)
-    # after a drop the gaps go darker, so the full-bright hits contrast more
-    floor_now = floor * (1.0 - 0.7 * drop)
-    if onset:
+    # after a drop the gaps go darker for contrast; a build lifts them
+    floor_now = 0.0 if blackout else \
+        min(60.0, floor * (1.0 - 0.7 * drop) + 30.0 * tension)
+    if hit or t < state["impact_until"]:
+        state["dim"] = 100.0
+    elif blackout:
+        state["dim"] = 0.0
+    elif t - state["kick_t"] < ONSET_RISE_S:
         # a detected beat already cleared the adaptive threshold, so it always
         # pops; strength modulates the top half (soft beat 50% -> hard 100%) and
         # bass level sets the headroom (bass-less build ~35% -> drop 100%)
-        strength = float(np.clip(flux / max(state["flux_peak"], 1e-6), 0.0, 1.0))
-        headroom = max(drop, 0.35 + 0.65 * norm)
-        level = 100.0 if hit else floor_now + (100.0 - floor_now) * flash \
-            * (0.5 + 0.5 * strength) * headroom
+        # right after a drop every beat hits full, dynamics return as it fades
+        boost = min(1.0, 2.0 * drop)  # full for one half-life, then fades
+        headroom = max(boost, 0.35 + 0.65 * norm)
+        level = floor_now + (100.0 - floor_now) * flash \
+            * max(0.5 + 0.5 * state["kick_s"], boost) * headroom
+        prev = state["dim"]
+        state["dim"] = min(100.0, max(prev, level))
+        # the window's newest hop sits in the Hann taper, so the bass level
+        # (headroom) catches up a hop or two after the onset: let the flash
+        # keep rising, and send each rise straight away like the beat itself
+        if state["event"] is None and state["dim"] >= prev + 4:
+            state["event"] = "beat"
+    elif snare_s is not None and tension >= 0.2:
+        # snare rolls pulse harder as the build tightens
+        level = floor_now + (100.0 - floor_now) * flash * 0.7 * tension \
+            * (0.5 + 0.5 * snare_s)
         state["dim"] = min(100.0, max(state["dim"], level))
     else:
         state["dim"] += decay * (floor_now - state["dim"])
     state["dim"] = float(np.clip(state["dim"], floor_now, 100.0))
 
-    r, g, b = np.clip(state["rgb"], 0, 255)
-    return int(r), int(g), int(b), int(state["dim"])
+    r, g, b_ = np.clip(rgb, 0, 255)
+    return int(r), int(g), int(b_), int(state["dim"])
+
+
+def replay(path, mode, rate=44100):
+    """Run the live detector over an audio file in real-time-sized chunks (no
+    bulbs) and log every beat/drop/near-miss: tune the constants against it.
+    Decodes with ffmpeg, which must be on PATH."""
+    import subprocess
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1",
+                          "-ar", str(rate), "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    x = np.frombuffer(raw, np.float32).astype(float)
+    state = new_map_state()
+    drops = []
+    for i in range(len(x) // CHUNK):
+        audio_to_color(x[i * CHUNK:(i + 1) * CHUNK], rate, state,
+                       sensitivity=mode["sens"], mode=mode)
+        if state["drop_hit"]:
+            drops.append(round(state["t"], 1))
+    print(f"{len(drops)} drop(s) at {drops}s")
 
 
 # ---------------------------------------------------------------- audio in
@@ -456,10 +648,11 @@ class App:
         self.stop_event = threading.Event()
         self.worker_thread = None
         self.current = (0, 0, 0, 10)  # last computed color, read by GUI poll
-        self.env_hist = np.zeros(140)  # scrolling bass level (0..1)
-        self.beat_hist = np.zeros(140)  # 1.0 where a beat fired, else 0
+        self.env_hist = np.zeros(280)  # scrolling bass level (0..1), ~3s
+        self.beat_hist = np.zeros(280)  # 1.0 where a beat fired, else 0
         self.spectrum = np.zeros(N_BARS)  # latest spectrum bars (0..1)
         self.status_text = "Idle"
+        self._found = None  # discovery result, handed to the GUI thread by poll
         self.mode = MODES[DEFAULT_MODE]
         self.viz_w, self.viz_h, self.top_h = 400, 120, 64
         self._pwr_off, self._pwr_pressed = 0, False  # power-switch depth state
@@ -471,11 +664,13 @@ class App:
         self.smooth = tk.DoubleVar(value=self.mode["smooth"])
         self.floor = tk.DoubleVar(value=self.mode["floor"])
         self.flash = tk.DoubleVar(value=self.mode["flash"])
-        # the worker reads this plain snapshot, never the tk vars: a tk call
-        # from another thread blocks until the GUI thread services it, which
-        # stalls audio reads and makes the lights lag the beat
+        self.delay_ms = tk.IntVar(value=0)  # hold lights back to match speakers
+        # the worker reads this plain snapshot, never the tk vars or self.mode:
+        # a tk call from another thread blocks until the GUI thread services
+        # it, which stalls audio reads and makes the lights lag the beat. the
+        # dict is replaced whole, so the worker never sees a half-update
         for v in (self.sensitivity, self.max_bright, self.smooth, self.floor,
-                  self.flash):
+                  self.flash, self.delay_ms):
             v.trace_add("write", self._snap_params)
         self._snap_params()
 
@@ -577,6 +772,13 @@ class App:
         self.ip_entry.grid(row=4, column=0, sticky="we", pady=(8, 0))
         ttk.Button(lf, text="Add IP", command=self.add_ip).grid(
             row=4, column=1, sticky="we", padx=(8, 0), pady=(8, 0))
+        # Bluetooth speakers play ~150-300ms late; WiZ bulbs react in ~50-100.
+        # if the lights land before the beat you hear, raise this
+        ttk.Label(lf, text="Light delay (ms)").grid(row=5, column=0, sticky="w",
+                                                    pady=(8, 0))
+        ttk.Spinbox(lf, from_=0, to=500, increment=10, width=6,
+                    textvariable=self.delay_ms).grid(
+            row=5, column=1, sticky="we", padx=(8, 0), pady=(8, 0))
 
         mf = ttk.Frame(panel)
         mf.grid(row=0, column=1, sticky="ne")
@@ -646,10 +848,15 @@ class App:
             self._recompute_pwr()
 
     def _snap_params(self, *_):
+        try:  # a half-typed spinbox value reads as an error
+            delay = max(0, min(500, int(self.delay_ms.get())))
+        except (tk.TclError, ValueError):
+            delay = self.params["delay"] if hasattr(self, "params") else 0
         self.params = dict(sensitivity=self.sensitivity.get(),
                            smooth=self.smooth.get(), floor=self.floor.get(),
                            flash=self.flash.get(),
-                           max_bright=self.max_bright.get())
+                           max_bright=self.max_bright.get(),
+                           mode=self.mode, delay=delay / 1000.0)
 
     def on_mode(self, *_):
         self.mode = MODES[self.mode_name.get()]
@@ -657,13 +864,13 @@ class App:
         self.sensitivity.set(self.mode["sens"])
         self.floor.set(self.mode["floor"])
         self.flash.set(self.mode["flash"])
+        self._snap_params()
 
     # ---- lights list
     def discover(self):
         self.status_text = "Discovering..."
-        def run():
-            ips = discover_lights()
-            self.root.after(0, lambda: self._fill_lights(ips))
+        def run():  # tk is touched only on the GUI thread: poll() picks it up
+            self._found = discover_lights()
         threading.Thread(target=run, daemon=True).start()
 
     def _fill_lights(self, ips):
@@ -686,7 +893,8 @@ class App:
 
     def save_lights(self):
         data = {"lights": list(self.listbox.get(0, tk.END)),
-                "selected": self.selected_ips()}
+                "selected": self.selected_ips(),
+                "delay_ms": int(self.params["delay"] * 1000)}
         try:
             with open(LIGHTS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -700,6 +908,7 @@ class App:
                 data = json.load(f)
         except (OSError, ValueError):
             return
+        self.delay_ms.set(int(data.get("delay_ms", 0)))
         selected = set(data.get("selected", []))
         for ip in data.get("lights", []):
             self.listbox.insert(tk.END, ip)
@@ -743,8 +952,14 @@ class App:
         last_sent = (0, 0, 0, 0)
         last_send_t = 0.0
         last_audio_t = time.time()
+        pending = deque()  # (send_at, rgbd, repeats) waiting out the delay
         try:
             while not self.stop_event.is_set():
+                now = time.time()
+                while pending and pending[0][0] <= now:
+                    _, pkt, reps = pending.popleft()
+                    for _ in range(reps):
+                        sender.set_color(*pkt)
                 avail = stream.get_read_available()
                 if avail >= CHUNK:
                     if avail >= 3 * CHUNK:
@@ -763,12 +978,12 @@ class App:
                 else:
                     time.sleep(0.002)
                     continue
-                p = self.params
+                p = self.params  # one read: a consistent snapshot
                 r, g, b, dim = audio_to_color(
                     mono, rate, state,
                     sensitivity=p["sensitivity"],
                     smooth=p["smooth"],
-                    mode=self.mode,
+                    mode=p["mode"],
                     floor=p["floor"],
                     flash=p["flash"])
                 dim = int(dim * p["max_bright"] / 100.0)
@@ -781,14 +996,22 @@ class App:
                 now = time.time()
                 changed = max(abs(a - b_) for a, b_ in
                               zip((r, g, b, dim), last_sent)) >= 4
-                # beats always go out at once, at full flash; the onset
-                # refractory (120ms) already caps them at ~8/s
-                due = state["onset"] \
+                # beats and drops always go out at once, at full flash (the
+                # kick refractory caps them at 5/s); the rest is rate-limited.
+                # a drop goes twice: UDP has no retry and it's the one that
+                # must not be lost
+                ev = state["event"]
+                due = ev is not None \
                     or (now - last_send_t >= 1.0 / SEND_HZ
                         and (changed or now - last_send_t >= 1.0))
                 if due:
-                    sender.set_color(r, g, b, dim)
-                    last_sent = (r, g, b, dim)
+                    pkt, reps = (r, g, b, dim), 2 if ev == "drop" else 1
+                    if p["delay"] > 0:
+                        pending.append((now + p["delay"], pkt, reps))
+                    else:
+                        for _ in range(reps):
+                            sender.set_color(*pkt)
+                    last_sent = pkt
                     last_send_t = now
         finally:
             stream.stop_stream()
@@ -800,6 +1023,9 @@ class App:
 
     # ---- GUI poll
     def poll(self):
+        if self._found is not None:
+            ips, self._found = self._found, None
+            self._fill_lights(ips)
         r, g, b, _ = self.current
         running = bool(self.worker_thread and self.worker_thread.is_alive())
         color = f"#{r:02x}{g:02x}{b:02x}"
@@ -847,6 +1073,23 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    import argparse
+    ap = argparse.ArgumentParser(description="WiZ Sync")
+    ap.add_argument("--debug", action="store_true",
+                    help="log beats/drops/near-misses to wiz_sync_debug.log")
+    ap.add_argument("--replay", metavar="AUDIO",
+                    help="run the detector over a file (needs ffmpeg), no GUI")
+    ap.add_argument("--mode", default=DEFAULT_MODE, choices=list(MODES))
+    args = ap.parse_args()
+    if args.replay:
+        logging.basicConfig(level=logging.DEBUG, format="%(message)s")
+        replay(args.replay, MODES[args.mode])
+    else:
+        if args.debug or os.environ.get("WIZ_SYNC_DEBUG"):
+            # the windowed exe has no console, so the log goes to a file
+            logging.basicConfig(
+                level=logging.DEBUG, format="%(asctime)s %(message)s",
+                filename=os.path.join(_BASE, "wiz_sync_debug.log"))
+        root = tk.Tk()
+        App(root)
+        root.mainloop()
