@@ -1,0 +1,49 @@
+# Windows build: tests, PyInstaller one-folder app, Inno Setup installer.
+# Both are uploaded as workflow artifacts.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Test
+        run: python test_mapping.py
+
+      - name: Build app
+        run: python -m PyInstaller --noconfirm wiz-sync.spec
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc packaging\wiz-sync.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WiZSync-Setup
+          path: dist/WiZSync-Setup-*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wiz-sync-portable
+          path: dist/wiz-sync/
