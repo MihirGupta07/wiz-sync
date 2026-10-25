@@ -173,3 +173,13 @@ assert len(hits) == 1 and dims[hits[0]] == 100, f"drop after blackout: {hits}"
 assert len(state["spectrum"]) == N_BARS
 
 print("all mapping checks passed")
+
+# bulb model -> what it can show (moduleName from getSystemConfig)
+from wiz_sync import bulb_kind
+assert bulb_kind("ESP25_SHRGB_01") == "Colour"
+assert bulb_kind("ESP01_SHRGBC1_31") == "Colour"
+assert bulb_kind("ESP01_SHTW1C_31") == "White only"
+assert bulb_kind("ESP06_SHDW9_01") == "White only"
+assert bulb_kind("ESP10_SOCKET_06") == ""
+assert bulb_kind("") == ""
+print("bulb kind checks passed")

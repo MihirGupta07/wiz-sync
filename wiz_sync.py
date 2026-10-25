@@ -93,6 +93,40 @@ def discover_lights(timeout=2.0):
     return sorted(found)
 
 
+def bulb_kind(module):
+    """moduleName (e.g. ESP25_SHRGB_01) -> what the bulb can show."""
+    parts = module.split("_")
+    kind = parts[1] if len(parts) > 1 else module
+    if "RGB" in kind:
+        return "Colour"
+    if "TW" in kind or "DW" in kind:  # tunable / dimmable white
+        return "White only"
+    return ""
+
+
+def light_kinds(ips, timeout=1.0):
+    """Ask each light for its model; return {ip: bulb_kind}."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.2)
+    for ip in ips:
+        try:
+            s.sendto(b'{"method":"getSystemConfig","params":{}}', (ip, WIZ_PORT))
+        except OSError:
+            pass
+    kinds = {}
+    deadline = time.time() + timeout
+    while time.time() < deadline and len(kinds) < len(ips):
+        try:
+            data, addr = s.recvfrom(2048)
+            kinds[addr[0]] = bulb_kind(json.loads(data)["result"]["moduleName"])
+        except socket.timeout:
+            pass
+        except (ValueError, KeyError, TypeError):
+            pass  # not a getSystemConfig reply
+    s.close()
+    return kinds
+
+
 class WizSender:
     def __init__(self, ips):
         self.ips = list(ips)
@@ -671,6 +705,7 @@ class App:
         self.spectrum = np.zeros(N_BARS)  # latest spectrum bars (0..1)
         self.status_text = "Idle"
         self._found = None  # discovery result, handed to the GUI thread by poll
+        self._kinds = None  # {ip: bulb kind}, likewise
         self.mode = MODES[DEFAULT_MODE]
         self.viz_w, self.viz_h, self.top_h = 400, 120, 64
         self._pwr_off, self._pwr_pressed = 0, False  # power-switch depth state
@@ -888,29 +923,55 @@ class App:
     def discover(self):
         self.status_text = "Discovering..."
         def run():  # tk is touched only on the GUI thread: poll() picks it up
-            self._found = discover_lights()
+            self._found = found = discover_lights()
+            self._kinds = light_kinds(found)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _probe(self, ips):
+        """Look up bulb models in the background; poll() labels the list."""
+        def run():
+            self._kinds = light_kinds(ips)
         threading.Thread(target=run, daemon=True).start()
 
     def _fill_lights(self, ips):
-        existing = set(self.listbox.get(0, tk.END))
+        existing = set(self.all_ips())
         for ip in ips:
             if ip not in existing:
                 self.listbox.insert(tk.END, ip)
         self.listbox.selection_set(0, tk.END)
         self.status_text = f"Found {len(ips)} light(s)"
 
+    def _label_lights(self, kinds):
+        # list rows read "192.168.1.5  Colour"; the IP is always the first word
+        for i, ip in enumerate(self.all_ips()):
+            if kinds.get(ip):
+                selected = self.listbox.selection_includes(i)
+                self.listbox.delete(i)
+                self.listbox.insert(i, f"{ip}  {kinds[ip]}")
+                if selected:
+                    self.listbox.selection_set(i)
+        white = sum(k == "White only" for k in kinds.values())
+        if white:
+            self.status_text = (f"{white} white-only bulb(s): "
+                                "brightness only, no colour")
+
     def add_ip(self):
         ip = self.ip_entry.get().strip()
-        if ip and ip not in self.listbox.get(0, tk.END):
+        if ip and ip not in self.all_ips():
             self.listbox.insert(tk.END, ip)
             self.listbox.selection_set(tk.END)
             self.ip_entry.delete(0, tk.END)
+            self._probe([ip])
+
+    def all_ips(self):
+        return [row.split()[0] for row in self.listbox.get(0, tk.END)]
 
     def selected_ips(self):
-        return [self.listbox.get(i) for i in self.listbox.curselection()]
+        return [self.listbox.get(i).split()[0]
+                for i in self.listbox.curselection()]
 
     def save_lights(self):
-        data = {"lights": list(self.listbox.get(0, tk.END)),
+        data = {"lights": self.all_ips(),
                 "selected": self.selected_ips(),
                 "delay_ms": int(self.params["delay"] * 1000)}
         try:
@@ -934,6 +995,7 @@ class App:
                 self.listbox.selection_set(tk.END)
         if data.get("lights"):
             self.status_text = f"Loaded {len(data['lights'])} saved light(s)"
+            self._probe(data["lights"])
 
     def remove_selected(self):
         for i in reversed(self.listbox.curselection()):
@@ -1044,6 +1106,9 @@ class App:
         if self._found is not None:
             ips, self._found = self._found, None
             self._fill_lights(ips)
+        if self._kinds is not None:
+            kinds, self._kinds = self._kinds, None
+            self._label_lights(kinds)
         r, g, b, _ = self.current
         running = bool(self.worker_thread and self.worker_thread.is_alive())
         color = f"#{r:02x}{g:02x}{b:02x}"
