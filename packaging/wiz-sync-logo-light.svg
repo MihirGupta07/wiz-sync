@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" fill="none">
+  <defs>
+    <linearGradient id="spectrum" x1="70" y1="250" x2="330" y2="90" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/><stop offset="0.32" stop-color="#3B82F6"/><stop offset="0.62" stop-color="#8B5CF6"/><stop offset="0.82" stop-color="#EC4899"/><stop offset="1" stop-color="#FDBA74"/>
+    </linearGradient>
+    <linearGradient id="word" x1="430" y1="100" x2="1040" y2="245" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/><stop offset="0.5" stop-color="#3730A3"/><stop offset="1" stop-color="#0891B2"/>
+    </linearGradient>
+  </defs>
+  <!-- Compact waveform + light ring mark -->
+  <g stroke="url(#spectrum)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M55 174V208"/><path d="M91 145V237"/><path d="M127 116V266"/><path d="M163 145V237"/>
+    <path d="M199 180C199 119 248 78 300 91C343 102 365 143 357 181C350 217 321 240 285 240"/>
+    <path d="M285 240L264 240"/>
+  </g>
+  <g stroke="url(#spectrum)" stroke-width="9" stroke-linecap="round">
+    <path d="M273 55V36"/><path d="M354 83L368 69"/><path d="M383 151H403"/><path d="M355 250L370 265"/><path d="M273 278V298"/>
+  </g>
+  <text x="440" y="211" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="112" font-weight="750" letter-spacing="-5" fill="url(#word)">WiZ</text>
+  <text x="650" y="211" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="106" font-weight="400" letter-spacing="-4" fill="#4F46E5">Sync</text>
+</svg>

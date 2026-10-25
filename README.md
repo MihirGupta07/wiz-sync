@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="packaging/wiz-sync-512.png" alt="WiZ Sync icon" width="128">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="packaging/wiz-sync-logo.svg">
+    <img src="packaging/wiz-sync-logo-light.svg" alt="WiZ Sync logo" width="480">
+  </picture>
 </p>
 
 <h1 align="center">WiZ Sync — Music Sync for Philips WiZ Smart Bulbs on Windows</h1>
@@ -33,7 +36,7 @@ WiZ Sync is a free Windows desktop app that syncs **Philips WiZ smart bulbs to m
 
 ### Installer
 
-1. Download **`WiZSync-Setup-1.0.0.exe`** from the [latest release](https://github.com/MihirGupta07/wiz-sync/releases/latest).
+1. Download **`WiZSync-Setup-1.0.1.exe`** from the [latest release](https://github.com/MihirGupta07/wiz-sync/releases/latest).
 2. Run it. It installs for your user account only, with no admin rights needed.
 
 ### Windows Package Manager (WinGet)
