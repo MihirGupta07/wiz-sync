@@ -1,0 +1,77 @@
+# Windows build: tests, PyInstaller one-folder app, Inno Setup installer.
+# Both are uploaded as workflow artifacts.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Test
+        run: python test_mapping.py
+
+      - name: Build app
+        run: python -m PyInstaller --noconfirm wiz-sync.spec
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc packaging\wiz-sync.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WiZSync-Setup
+          path: dist/WiZSync-Setup-*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wiz-sync-portable
+          path: dist/wiz-sync/
+
+  # pushing a vX.Y.Z tag publishes the installer as a GitHub release, with
+  # packaging/release-notes.md as the notes and the installer's SHA256
+  release:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: WiZSync-Setup
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          exe="dist/WiZSync-Setup-$ver.exe"
+          test -f "$exe" || { echo "::error::$exe not built: tag doesn't match AppVersion in packaging/wiz-sync.iss"; exit 1; }
+          sha=$(sha256sum "$exe" | cut -d' ' -f1 | tr a-f A-F)
+          { cat packaging/release-notes.md; echo; echo "SHA256: \`$sha\`"; } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$exe" --repo "$GITHUB_REPOSITORY" \
+            --title "WiZ Sync $ver" --notes-file notes.md

@@ -25,6 +25,7 @@ WiZ Sync is a free Windows desktop app that syncs **Philips WiZ smart bulbs to m
 - **Bass-driven colour.** Colour follows the low end, from cool blue when the bass is light to deep red when it's heavy.
 - **Build-ups and drops.** Builds wash toward white and pulse with the snare roll. Drops land with a full-white impact, and the beats after hit at full brightness.
 - **Blackouts.** The lights cut out when the music suddenly goes quiet.
+- **Play your own songs and videos.** Open a music file and the lights flash to its beat. Open a video and they glow with the colours on screen, like an ambient TV backlight. See [Play a song or video](#play-a-song-or-video).
 - **Seven presets:** Rave, Techno, Disco, Party, Pop, Concert and Jazz.
 - **Fine-tuning knobs:** Sensitivity, Brightness, Smoothing, Floor and Flash.
 - **Light delay** so the lights line up with Bluetooth speakers and headphones.
@@ -36,7 +37,7 @@ WiZ Sync is a free Windows desktop app that syncs **Philips WiZ smart bulbs to m
 
 ### Installer
 
-1. Download **`WiZSync-Setup-1.0.1.exe`** from the [latest release](https://github.com/MihirGupta07/wiz-sync/releases/latest).
+1. Download **`WiZSync-Setup-1.1.0.exe`** from the [latest release](https://github.com/MihirGupta07/wiz-sync/releases/latest).
 2. Run it. It installs for your user account only, with no admin rights needed.
 
 ### Windows Package Manager (WinGet)
@@ -57,6 +58,17 @@ winget install MihirGupta.WiZSync
 4. Press the red **power jewel** and play some music.
 5. Turn the **Mode** knob to switch presets. If the lights lag behind Bluetooth audio, raise **Light delay**.
 
+### Play a song or video
+
+The **Player** row plays a file from your PC and syncs the lights to it instead of to the PC's audio output.
+
+1. Select your bulbs, click **Open...** and pick a file. It starts playing straight away.
+2. **Music** (MP3, WAV, FLAC, M4A, OGG and more): the lights use the same beat, build-up and drop engine as live sync, and the **Mode** and other knobs still apply. WiZ Sync plays the audio itself, so it knows when each beat reaches the speakers and times the flashes to match.
+3. **Video** (MP4, MKV, MOV, AVI, WebM and more): the video plays in its own window. The lights take the scene's main colour, with brightness that follows the picture. Colours fade smoothly and switch instantly on a scene cut.
+4. Use **Play/Pause**, **Stop**, the seek bar and **Vol** to control playback. **Bright** and **Light delay** apply too.
+
+Playing files needs [ffmpeg](https://ffmpeg.org). Install it with `winget install ffmpeg`, or put `ffmpeg.exe` in the WiZ Sync install folder.
+
 Your saved bulbs and settings are stored in `%LOCALAPPDATA%\WiZ Sync`.
 
 ## Requirements
@@ -64,6 +76,7 @@ Your saved bulbs and settings are stored in `%LOCALAPPDATA%\WiZ Sync`.
 - Windows 10 or Windows 11 (64-bit)
 - Philips WiZ (or WiZ Connected) Wi-Fi bulbs, light strips or lamps on the same local network
 - Any audio output device: speakers, headphones, HDMI or Bluetooth
+- [ffmpeg](https://ffmpeg.org), only for playing your own songs and videos
 
 ## FAQ
 

@@ -1,4 +1,5 @@
-"""WiZ Sync — syncs WiZ light colors to PC audio output (WASAPI loopback).
+"""WiZ Sync — syncs WiZ light colors to PC audio output (WASAPI loopback),
+or to a music/video file it plays itself.
 
 Run: python wiz_sync.py
 """
@@ -8,19 +9,22 @@ import json
 import logging
 import math
 import os
+import queue
+import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 from collections import deque
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import numpy as np
 import pyaudiowpatch as pyaudio
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 WIZ_PORT = 38899
 # saved lights + debug log: next to the script when run from source; when
 # installed, in %LOCALAPPDATA%\WiZ Sync (the install folder may be read-only)
@@ -153,6 +157,38 @@ class WizSender:
 
     def close(self):
         self.sock.close()
+
+
+class LightOut:
+    """What reaches the bulbs, and when. Events (beats, drops, scene cuts) go
+    out at once - a drop twice: UDP has no retry and it's the one that must
+    not be lost; the rest is rate-limited to SEND_HZ, sent when it changed or
+    once a second as a keep-alive. `at` holds a packet back until then (for
+    speakers that play late, or audio still sitting in the output buffer)."""
+
+    def __init__(self, sender):
+        self.sender = sender
+        self.pending = deque()  # (send_at, rgbd, repeats)
+        self.last, self.last_t = (0, 0, 0, 0), 0.0
+
+    def flush(self, now):
+        while self.pending and self.pending[0][0] <= now:
+            _, pkt, reps = self.pending.popleft()
+            for _ in range(reps):
+                self.sender.set_color(*pkt)
+
+    def push(self, pkt, event, now, at=None):
+        changed = max(abs(a - b) for a, b in zip(pkt, self.last)) >= 4
+        if event is None and not (now - self.last_t >= 1.0 / SEND_HZ
+                                  and (changed or now - self.last_t >= 1.0)):
+            return
+        reps = 2 if event == "drop" else 1
+        if at is not None and at > now:
+            self.pending.append((at, pkt, reps))
+        else:
+            for _ in range(reps):
+                self.sender.set_color(*pkt)
+        self.last, self.last_t = pkt, now
 
 
 # ------------------------------------------------------- audio -> color
@@ -514,8 +550,7 @@ def replay(path, mode, rate=44100):
     """Run the live detector over an audio file in real-time-sized chunks (no
     bulbs) and log every beat/drop/near-miss: tune the constants against it.
     Decodes with ffmpeg, which must be on PATH."""
-    import subprocess
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-ac", "1",
+    raw = subprocess.run([find_ffmpeg() or "ffmpeg", "-v", "error", "-i", path, "-ac", "1",
                           "-ar", str(rate), "-f", "f32le", "-"],
                          capture_output=True, check=True).stdout
     x = np.frombuffer(raw, np.float32).astype(float)
@@ -527,6 +562,168 @@ def replay(path, mode, rate=44100):
         if state["drop_hit"]:
             drops.append(round(state["t"], 1))
     print(f"{len(drops)} drop(s) at {drops}s")
+
+
+# ------------------------------------------------------------ media files
+# Play a song or video and drive the lights from it. ffmpeg decodes, and we
+# play the audio ourselves, so the beat engine sees exactly the samples that
+# are heard - and knows when each one leaves the speakers - instead of a
+# loopback copy. Music -> audio_to_color; video -> the picture's ambient
+# colour, video_to_color.
+
+MEDIA_RATE = 48000
+VIDEO_BOX = (640, 360)       # frames are decoded to fit this (the screen size)
+VIDEO_MAX_FPS = 30
+AMBIENT_HALF_S = 0.25        # colour glide between frames
+AMBIENT_CUT = 40.0           # mean pixel change that counts as a scene cut
+MEDIA_TYPES = [("Music and video", "*.mp3 *.wav *.flac *.m4a *.aac *.ogg "
+                "*.opus *.wma *.mp4 *.mkv *.mov *.avi *.webm *.wmv *.m4v"),
+               ("All files", "*.*")]
+_AUDIO_ARGS = ["-vn", "-ac", "2", "-ar", str(MEDIA_RATE), "-f", "f32le"]
+# the windowed exe would flash a console window for every ffmpeg it starts
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def find_ffmpeg():
+    """ffmpeg next to the app (drop ffmpeg.exe there) or on PATH, else None."""
+    here = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
+                           else os.path.abspath(__file__))
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for d in (here, _BASE):
+        if os.path.isfile(os.path.join(d, exe)):
+            return os.path.join(d, exe)
+    return shutil.which("ffmpeg")
+
+
+def parse_probe(text):
+    """ffmpeg's `-i` banner -> {duration, audio, video, w, h, fps}. A song's
+    cover art shows up as an 'attached pic' video stream: that's not video."""
+    info = dict(duration=0.0, audio=False, video=False, w=0, h=0, fps=0.0)
+    m = re.search(r"Duration: (\d+):(\d\d):(\d\d(?:\.\d+)?)", text)
+    if m:
+        info["duration"] = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+    for line in text.splitlines():
+        if not re.match(r"\s*Stream #", line):
+            continue
+        if ": Audio:" in line:
+            info["audio"] = True
+        elif (": Video:" in line and "attached pic" not in line
+              and not info["video"]):
+            size = re.search(r", (\d{2,5})x(\d{2,5})", line)
+            if size:
+                fps = re.search(r"([\d.]+) fps", line)
+                info.update(video=True, w=int(size[1]), h=int(size[2]),
+                            fps=float(fps[1]) if fps else 25.0)
+    return info
+
+
+def probe_media(ff, path):
+    """What's in a file (see parse_probe). Raises ValueError if nothing
+    playable."""
+    text = subprocess.run([ff, "-hide_banner", "-nostdin", "-i", path],
+                          capture_output=True, text=True, errors="replace",
+                          creationflags=_NO_WINDOW).stderr
+    info = parse_probe(text)
+    if not (info["audio"] or info["video"]):
+        lines = text.strip().splitlines()
+        raise ValueError(lines[-1] if lines else "not a music or video file")
+    return info
+
+
+def video_size(w, h, box=VIDEO_BOX):
+    """Fit w x h inside box (never upscaled), even sides for the scaler."""
+    s = min(box[0] / w, box[1] / h, 1.0)
+    return max(2, int(w * s) // 2 * 2), max(2, int(h * s) // 2 * 2)
+
+
+def _ffmpeg_pipe(ff, path, start, args):
+    """Decode path from `start` seconds to raw data on stdout."""
+    return subprocess.Popen(
+        [ff, "-v", "error", "-nostdin", "-ss", f"{start:.3f}", "-i", path,
+         *args, "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        creationflags=_NO_WINDOW)
+
+
+class FrameReader:
+    """Decodes rgb24 frames on its own thread, a few ahead of the clock, so a
+    slow frame never stalls the audio."""
+
+    def __init__(self, ff, path, start, w, h, fps):
+        self.w, self.h, self.fps, self.start = w, h, fps, start
+        self.q = queue.Queue(maxsize=8)
+        self._next = None  # frame taken off the queue but not yet due
+        self.done = False
+        self.proc = _ffmpeg_pipe(ff, path, start, [
+            "-an", "-vf", f"scale={w}:{h},fps={fps:g}", "-pix_fmt", "rgb24",
+            "-f", "rawvideo"])
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        n, i = self.w * self.h * 3, 0
+        try:
+            while True:
+                data = self.proc.stdout.read(n)
+                if len(data) < n:
+                    break
+                frame = np.frombuffer(data, np.uint8).reshape(self.h, self.w, 3)
+                self.q.put((self.start + i / self.fps, frame))
+                i += 1
+        except (OSError, ValueError):
+            pass  # closed under us
+        self.done = True
+
+    def due(self, t):
+        """The newest frame whose time has come (older ones skipped), or None."""
+        out = None
+        while True:
+            if self._next is None:
+                try:
+                    self._next = self.q.get_nowait()
+                except queue.Empty:
+                    return out
+            if self._next[0] > t:
+                return out
+            out, self._next = self._next[1], None
+
+    @property
+    def finished(self):
+        return self.done and self._next is None and self.q.empty()
+
+    def close(self):
+        self.proc.kill()
+        try:  # unblock a put() so the thread sees the closed pipe and exits
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+
+
+def video_to_color(frame, dt, state):
+    """Ambient light for one video frame -> (r, g, b, dimming). Mutates state.
+
+    Colour is the scene's dominant hue - vivid pixels outweigh grey ones, so
+    a red car on grey tarmac reads red, while a grey scene reads white - at
+    full intensity; the frame's brightness goes on the dimmer. Glides between
+    frames, snaps on a scene cut (state["cut"])."""
+    px = frame[::4, ::4].reshape(-1, 3).astype(float)
+    hi, lo = px.max(axis=1), px.min(axis=1)
+    weight = ((hi - lo) / np.maximum(hi, 1.0)) ** 2 * (hi / 255.0) + 0.02
+    rgb = (px * weight[:, None]).sum(axis=0) / weight.sum()
+    rgb *= 255.0 / max(float(rgb.max()), 1.0)
+    luma = float(np.mean(px @ np.array([0.2126, 0.7152, 0.0722]))) / 255.0
+    dim = 10.0 + 90.0 * luma ** 0.6  # lift the darks: bulbs bottom out at 10%
+    prev = state.get("px")
+    cut = prev is None or prev.shape != px.shape \
+        or float(np.mean(np.abs(px - prev))) > AMBIENT_CUT
+    a = 1.0 if cut else 1 - 0.5 ** (dt / AMBIENT_HALF_S)
+    if cut:
+        state["rgb"], state["dim"] = rgb, dim
+    else:
+        state["rgb"] = state["rgb"] + a * (rgb - state["rgb"])
+        state["dim"] += a * (dim - state["dim"])
+    state.update(px=px, cut=cut, luma=luma)
+    r, g, b = np.clip(state["rgb"], 0, 255)
+    return int(r), int(g), int(b), int(round(state["dim"]))
 
 
 # ---------------------------------------------------------------- audio in
@@ -687,6 +884,12 @@ class Knob:
         self._apply(self._base + self._turn / self.SWEEP)
 
 
+def _clock(s):
+    s = int(max(s, 0))
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 \
+        else f"{s // 60}:{s % 60:02d}"
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -709,6 +912,16 @@ class App:
         self.mode = MODES[DEFAULT_MODE]
         self.viz_w, self.viz_h, self.top_h = 400, 120, 64
         self._pwr_off, self._pwr_pressed = 0, False  # power-switch depth state
+        # media player. the worker publishes media_pos / video_frame; the GUI
+        # asks for pause and seek through media_paused / _seek_req
+        self.worker_kind = None  # "loopback" | "media" while a worker runs
+        self.ffmpeg = None
+        self.media_path, self.media_info = None, None
+        self.media_paused, self._seek_req = False, None
+        self.media_pos = 0.0
+        self.video_frame = None  # (sequence no, rgb frame)
+        self.screen, self._shown = None, -1  # video window, last frame shown
+        self._dragging = False  # user holding the seek slider
 
         self._setup_style()
         self.mode_name = tk.StringVar(value=DEFAULT_MODE)
@@ -718,12 +931,14 @@ class App:
         self.floor = tk.DoubleVar(value=self.mode["floor"])
         self.flash = tk.DoubleVar(value=self.mode["flash"])
         self.delay_ms = tk.IntVar(value=0)  # hold lights back to match speakers
+        self.volume = tk.DoubleVar(value=0.8)
+        self.seek_pos = tk.DoubleVar(value=0.0)
         # the worker reads this plain snapshot, never the tk vars or self.mode:
         # a tk call from another thread blocks until the GUI thread services
         # it, which stalls audio reads and makes the lights lag the beat. the
         # dict is replaced whole, so the worker never sees a half-update
         for v in (self.sensitivity, self.max_bright, self.smooth, self.floor,
-                  self.flash, self.delay_ms):
+                  self.flash, self.delay_ms, self.volume):
             v.trace_add("write", self._snap_params)
         self._snap_params()
 
@@ -847,9 +1062,40 @@ class App:
             j * bw, self.viz_h, (j + 1) * bw - 1, self.viz_h,
             fill=BAR_REST, width=0) for j in range(N_BARS)]
 
+        # player: open a song or video; the lights follow it instead of
+        # the PC's audio while it plays
+        pf = ttk.Frame(panel)
+        pf.grid(row=1, column=0, columnspan=2, sticky="we", pady=(14, 0))
+        pf.columnconfigure(4, weight=1)
+        ttk.Label(pf, text="PLAYER", style="Sec.TLabel").grid(
+            row=0, column=0, columnspan=7, sticky="w", pady=(0, 6))
+        ttk.Button(pf, text="Open...", command=self.open_media).grid(
+            row=1, column=0)
+        self.play_btn = ttk.Button(pf, text="Play", width=6,
+                                   command=self.play_pause)
+        self.play_btn.grid(row=1, column=1, padx=(6, 0))
+        ttk.Button(pf, text="Stop", width=6, command=self.stop_media).grid(
+            row=1, column=2, padx=(6, 0))
+        self.time_lbl = ttk.Label(pf, text="0:00 / 0:00", font=KNOB_VAL)
+        self.time_lbl.grid(row=1, column=3, padx=(12, 8))
+        self.seek = ttk.Scale(pf, from_=0, to=1, variable=self.seek_pos)
+        self.seek.grid(row=1, column=4, sticky="we")
+        self.seek.bind("<Button-1>", self._seek_press)
+        self.seek.bind("<ButtonRelease-1>", self._seek_release)
+        ttk.Label(pf, text="VOL", style="Sec.TLabel").grid(
+            row=1, column=5, padx=(12, 6))
+        ttk.Scale(pf, from_=0, to=1, length=90, variable=self.volume).grid(
+            row=1, column=6)
+        self.media_lbl = ttk.Label(
+            pf, style="Status.TLabel",
+            text="Open a song to flash the lights to its beat, "
+                 "or a video to light the room with its colours")
+        self.media_lbl.grid(row=2, column=0, columnspan=7, sticky="w",
+                            pady=(6, 0))
+
         self.status = ttk.Label(panel, style="Status.TLabel",
                                 wraplength=HEAD_W - 40, justify="left")
-        self.status.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.status.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _setup_style(self):
         s = ttk.Style()
@@ -874,6 +1120,9 @@ class App:
               foreground=[("pressed", "#000000")])
         s.configure("TEntry", fieldbackground=TOLEX2, foreground=CREAM,
                     insertcolor=CREAM, padding=6)
+        s.configure("Horizontal.TScale", background=GOLD, troughcolor=TOLEX2,
+                    bordercolor=GOLD_LO, lightcolor=GOLD_HI, darkcolor=GOLD_LO)
+        s.map("Horizontal.TScale", background=[("active", GOLD_HI)])
 
     # ---- power switch: latch in when running, momentary depress on click
     def _pwr_shift(self, px):
@@ -909,6 +1158,7 @@ class App:
                            smooth=self.smooth.get(), floor=self.floor.get(),
                            flash=self.flash.get(),
                            max_bright=self.max_bright.get(),
+                           volume=self.volume.get(),
                            mode=self.mode, delay=delay / 1000.0)
 
     def on_mode(self, *_):
@@ -1001,19 +1251,257 @@ class App:
         for i in reversed(self.listbox.curselection()):
             self.listbox.delete(i)
 
-    # ---- start/stop
+    # ---- start/stop. one worker drives the bulbs at a time: the live PC
+    # audio sync (power jewel) or the media player
+    def _running(self, kind=None):
+        alive = bool(self.worker_thread and self.worker_thread.is_alive())
+        return alive and kind in (None, self.worker_kind)
+
+    def _stop_worker(self):
+        if self._running():
+            self.stop_event.set()
+            self.worker_thread.join(timeout=2)
+
+    def _start_worker(self, kind, target, *args):
+        self.stop_event.clear()
+        self.worker_kind = kind
+        self.worker_thread = threading.Thread(target=target, args=args,
+                                              daemon=True)
+        self.worker_thread.start()
+
     def toggle(self):
-        if self.worker_thread and self.worker_thread.is_alive():
+        if self._running():
             self.stop_event.set()
             return
         ips = self.selected_ips()
         if not ips:
             self.status_text = "No lights selected"
             return
-        self.stop_event.clear()
-        self.worker_thread = threading.Thread(target=self.worker, args=(ips,),
-                                              daemon=True)
-        self.worker_thread.start()
+        self._start_worker("loopback", self.worker, ips)
+
+    # ---- media player
+    def open_media(self):
+        path = filedialog.askopenfilename(title="Open a song or video",
+                                          filetypes=MEDIA_TYPES)
+        if not path:
+            return
+        self.ffmpeg = self.ffmpeg or find_ffmpeg()
+        if not self.ffmpeg:
+            self.status_text = ("Playing files needs ffmpeg: run `winget "
+                                "install ffmpeg`, or put ffmpeg.exe next to "
+                                "WiZ Sync")
+            return
+        try:
+            info = probe_media(self.ffmpeg, path)
+        except (OSError, ValueError) as e:
+            self.status_text = f"Can't play {os.path.basename(path)}: {e}"
+            return
+        self.stop_media()
+        self.media_path, self.media_info = path, info
+        self.seek.configure(to=max(info["duration"], 1.0))
+        how = ("video: lights follow the picture" if info["video"]
+               else "music: lights follow the beat")
+        self.media_lbl.config(text=f"{os.path.basename(path)}  -  {how}")
+        self.play_pause()
+
+    def play_pause(self):
+        if self._running("media"):
+            self.media_paused = not self.media_paused
+            return
+        if not self.media_path:
+            self.open_media()
+            return
+        ips = self.selected_ips()
+        if not ips:
+            self.status_text = "No lights selected"
+            return
+        self._stop_worker()
+        self.media_paused, self._seek_req = False, None
+        start = self.media_pos
+        if start >= self.media_info["duration"] - 0.5:
+            start = 0.0  # finished: play it again from the top
+        if self.media_info["video"]:
+            self._open_screen()
+        self._start_worker("media", self.media_worker, ips, self.media_path,
+                           self.media_info, start)
+
+    def stop_media(self):
+        if self._running("media"):
+            self._stop_worker()
+        self.media_pos = 0.0
+        self.seek_pos.set(0.0)
+        self._close_screen()
+
+    def _seek_press(self, e):
+        self._dragging = True
+        if "slider" not in self.seek.identify(e.x, e.y):
+            # jump to the click (the stock trough click only steps by 1)
+            self.seek_pos.set(self.seek.get(e.x, e.y))
+            return "break"
+
+    def _seek_release(self, _e):
+        self._dragging = False
+        self.media_pos = self.seek_pos.get()
+        if self._running("media"):
+            self._seek_req = self.media_pos
+
+    def _open_screen(self):
+        w, h = video_size(self.media_info["w"], self.media_info["h"])
+        if self.screen is None:
+            self.screen = tk.Toplevel(self.root, bg="#000000")
+            self.screen.protocol("WM_DELETE_WINDOW", self.stop_media)
+            self.screen_c = tk.Canvas(self.screen, bg="#000000",
+                                      highlightthickness=0)
+            self.screen_c.pack()
+            self.screen_img = self.screen_c.create_image(0, 0, anchor="nw")
+            self._screen_tick(self.screen)
+        self.screen.title(os.path.basename(self.media_path))
+        self.screen_c.configure(width=w, height=h)
+        self._shown = -1
+
+    def _close_screen(self):
+        if self.screen is not None:
+            self.screen.destroy()
+            self.screen = None
+        self.video_frame = None
+
+    def _screen_tick(self, screen):
+        if self.screen is not screen:  # closed (or replaced): stop ticking
+            return
+        vf = self.video_frame
+        if vf is not None and vf[0] != self._shown:
+            h, w, _ = vf[1].shape
+            # PPM straight into a PhotoImage: no imaging library needed
+            self.photo = tk.PhotoImage(
+                data=b"P6 %d %d 255 " % (w, h) + vf[1].tobytes(), format="ppm")
+            self.screen_c.itemconfig(self.screen_img, image=self.photo)
+            self._shown = vf[0]
+        self.root.after(10, self._screen_tick, screen)
+
+    def _show(self, r, g, b, dim, level, state):
+        """Hand the GUI what to draw: jewel colour, monitor level/beats/bars.
+        (whole-value reassigns, so the GUI thread never reads a half-update)"""
+        self.current = (r, g, b, dim)
+        self.env_hist = np.append(self.env_hist[1:], level)
+        self.beat_hist = np.append(self.beat_hist[1:],
+                                   1.0 if state["onset"] else 0.0)
+        self.spectrum = state["spectrum"]
+
+    def media_worker(self, ips, path, info, start):
+        sender = WizSender(ips)
+        pa = pyaudio.PyAudio()
+        try:
+            stream = pa.open(format=pyaudio.paFloat32, channels=2,
+                             rate=MEDIA_RATE, output=True,
+                             frames_per_buffer=CHUNK)
+        except Exception as e:
+            self.status_text = f"Audio error: {e}"
+            pa.terminate()
+            sender.close()
+            return
+        # a chunk written now is heard once the device buffer ahead of it
+        # has played: the lights for it wait that long too
+        latency = stream.get_output_latency()
+        name = os.path.basename(path)
+        self.status_text = f"Playing {name} on {len(ips)} light(s)"
+        lights = LightOut(sender)
+        state, amb = new_map_state(), {}
+        size = video_size(info["w"], info["h"]) if info["video"] else None
+        fps = min(info["fps"] or 25.0, VIDEO_MAX_FPS)
+        seq, ambient, paused = 0, None, False
+        audio = video = None
+        nbytes = CHUNK * 2 * 4  # stereo float32
+
+        def close():
+            if audio:
+                audio.kill()
+            if video:
+                video.close()
+
+        def open_at(t):
+            nonlocal audio, video
+            close()
+            audio = _ffmpeg_pipe(self.ffmpeg, path, t, _AUDIO_ARGS) \
+                if info["audio"] else None
+            video = FrameReader(self.ffmpeg, path, t, *size, fps) \
+                if size else None
+
+        base, written = start, 0  # clock: base + what's been heard
+        ended = False
+        open_at(start)
+        try:
+            while not self.stop_event.is_set():
+                lights.flush(time.time())
+                seek = self._seek_req
+                if seek is not None:
+                    self._seek_req = None
+                    lights.pending.clear()
+                    base, written, ambient = seek, 0, None
+                    open_at(seek)
+                if self.media_paused:
+                    if not paused:  # lets the buffered audio play out
+                        stream.stop_stream()
+                        paused = True
+                        lights.pending.clear()
+                        self.media_pos = base + written / MEDIA_RATE
+                        self.status_text = f"Paused {name}"
+                    time.sleep(0.02)
+                    continue
+                if paused:
+                    stream.start_stream()
+                    paused = False
+                    base, written = self.media_pos, 0
+                    self.status_text = f"Playing {name} on {len(ips)} light(s)"
+                data = audio.stdout.read(nbytes) if audio else b""
+                if not data and (video is None or video.finished):
+                    ended = True
+                    break
+                # silence keeps the clock running for a video with no sound
+                # (or one that outlasts its soundtrack)
+                data += bytes(nbytes - len(data))
+                pcm = np.frombuffer(data, np.float32).reshape(-1, 2)
+                p = self.params
+                stream.write((pcm * p["volume"]).astype(np.float32).tobytes())
+                written += CHUNK
+                now = time.time()
+                pos = base + max(0.0, written / MEDIA_RATE - latency)
+                self.media_pos = pos
+                r, g, b, dim = audio_to_color(
+                    pcm.mean(axis=1).astype(float), MEDIA_RATE, state,
+                    sensitivity=p["sensitivity"], smooth=p["smooth"],
+                    mode=p["mode"], floor=p["floor"], flash=p["flash"])
+                ev, level = state["event"], state["env_norm"]
+                if video is not None:
+                    # video: the picture drives the lights; the soundtrack
+                    # still feeds the monitor's spectrum
+                    frame = video.due(pos)
+                    ev = None
+                    if frame is not None:
+                        seq += 1
+                        self.video_frame = (seq, frame)
+                        ambient = video_to_color(frame, 1.0 / fps, amb)
+                        ev = "cut" if amb["cut"] else None
+                    if ambient is None:
+                        continue
+                    r, g, b, dim = ambient
+                    level = amb["luma"]
+                    at = now + p["delay"]  # the frame is on screen now
+                else:
+                    at = now + latency + p["delay"]
+                dim = int(dim * p["max_bright"] / 100.0)
+                self._show(r, g, b, dim, level, state)
+                lights.push((r, g, b, dim), ev, now, at=at)
+            if ended:
+                self.media_pos = 0.0  # stopped by the user keeps its place
+        finally:
+            close()
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+            sender.restore_white()
+            sender.close()
+            self.status_text = (f"Finished {name}" if ended else "Stopped") \
+                + " (lights restored to warm white)"
 
     def worker(self, ips):
         sender = WizSender(ips)
@@ -1029,17 +1517,11 @@ class App:
         rate = int(dev["defaultSampleRate"])
         ch = dev["maxInputChannels"]
         state = new_map_state()
-        last_sent = (0, 0, 0, 0)
-        last_send_t = 0.0
+        lights = LightOut(sender)
         last_audio_t = time.time()
-        pending = deque()  # (send_at, rgbd, repeats) waiting out the delay
         try:
             while not self.stop_event.is_set():
-                now = time.time()
-                while pending and pending[0][0] <= now:
-                    _, pkt, reps = pending.popleft()
-                    for _ in range(reps):
-                        sender.set_color(*pkt)
+                lights.flush(time.time())
                 avail = stream.get_read_available()
                 if avail >= CHUNK:
                     if avail >= 3 * CHUNK:
@@ -1067,32 +1549,12 @@ class App:
                     floor=p["floor"],
                     flash=p["flash"])
                 dim = int(dim * p["max_bright"] / 100.0)
-                self.current = (r, g, b, dim)
-                # scroll visualiser buffers (whole-array reassign = atomic read)
-                self.env_hist = np.append(self.env_hist[1:], state["env_norm"])
-                self.beat_hist = np.append(self.beat_hist[1:],
-                                           1.0 if state["onset"] else 0.0)
-                self.spectrum = state["spectrum"]
+                self._show(r, g, b, dim, state["env_norm"], state)
+                # beats and drops go out at once, at full flash (the kick
+                # refractory caps them at 5/s)
                 now = time.time()
-                changed = max(abs(a - b_) for a, b_ in
-                              zip((r, g, b, dim), last_sent)) >= 4
-                # beats and drops always go out at once, at full flash (the
-                # kick refractory caps them at 5/s); the rest is rate-limited.
-                # a drop goes twice: UDP has no retry and it's the one that
-                # must not be lost
-                ev = state["event"]
-                due = ev is not None \
-                    or (now - last_send_t >= 1.0 / SEND_HZ
-                        and (changed or now - last_send_t >= 1.0))
-                if due:
-                    pkt, reps = (r, g, b, dim), 2 if ev == "drop" else 1
-                    if p["delay"] > 0:
-                        pending.append((now + p["delay"], pkt, reps))
-                    else:
-                        for _ in range(reps):
-                            sender.set_color(*pkt)
-                    last_sent = pkt
-                    last_send_t = now
+                lights.push((r, g, b, dim), state["event"], now,
+                            at=now + p["delay"])
         finally:
             stream.stop_stream()
             stream.close()
@@ -1110,7 +1572,17 @@ class App:
             kinds, self._kinds = self._kinds, None
             self._label_lights(kinds)
         r, g, b, _ = self.current
-        running = bool(self.worker_thread and self.worker_thread.is_alive())
+        running = self._running()
+        playing = self._running("media")
+        self.play_btn.config(
+            text="Pause" if playing and not self.media_paused else "Play")
+        if not self._dragging:
+            self.seek_pos.set(self.media_pos)
+        dur = self.media_info["duration"] if self.media_info else 0.0
+        self.time_lbl.config(
+            text=f"{_clock(self.seek_pos.get())} / {_clock(dur)}")
+        if not playing and self.screen is not None and self.media_pos == 0.0:
+            self._close_screen()  # the video played to the end
         color = f"#{r:02x}{g:02x}{b:02x}"
         w, top = self.viz_w, self.top_h
 

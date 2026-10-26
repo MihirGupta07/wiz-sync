@@ -183,3 +183,75 @@ assert bulb_kind("ESP06_SHDW9_01") == "White only"
 assert bulb_kind("ESP10_SOCKET_06") == ""
 assert bulb_kind("") == ""
 print("bulb kind checks passed")
+
+# ---- media files
+from wiz_sync import LightOut, parse_probe, video_size, video_to_color
+
+# ffmpeg's banner -> what's in the file; a song's cover art isn't video
+VIDEO = """Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mp4':
+  Duration: 00:03:21.50, start: 0.000000, bitrate: 2687 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1920x1080 [SAR 1:1 DAR 16:9], 2609 kb/s, 23.98 fps, 23.98 tbr, 24k tbn (default)
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s (default)"""
+SONG = """Input #0, mp3, from 'song.mp3':
+  Duration: 00:04:05.03, start: 0.025056, bitrate: 320 kb/s
+  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 320 kb/s
+  Stream #0:1: Video: mjpeg (Baseline), yuvj420p(pc, bt470bg/unknown/unknown), 600x600 [SAR 1:1 DAR 1:1], 90k tbr, 90k tbn (attached pic)"""
+v, s_ = parse_probe(VIDEO), parse_probe(SONG)
+assert v == dict(duration=201.5, audio=True, video=True, w=1920, h=1080,
+                 fps=23.98), v
+assert s_["audio"] and not s_["video"] and abs(s_["duration"] - 245.03) < 1e-6
+assert not any(parse_probe("song.txt: Invalid data found").values())
+
+# frames fit the screen box, keep their shape, never upscale, even sides
+assert video_size(1920, 1080) == (640, 360)
+assert video_size(1080, 1920) == (202, 360)
+assert video_size(320, 241) == (320, 240)
+
+
+def frame(rgb, h=72, w=128):
+    return np.tile(np.array(rgb, np.uint8), (h, w, 1))
+
+
+# ambient colour is the scene's vivid colour, not the grey around it
+st = {}
+f = frame((120, 120, 120))
+f[20:50, 40:90] = (200, 20, 20)  # a red car on grey tarmac
+r, g, b, dim = video_to_color(f, 1 / 24, st)
+assert r > 200 and g < 120 and b < 120, f"vivid colour should win: {(r, g, b)}"
+# a grey scene reads white, a dark scene dims down, a bright one up
+r, g, b, _ = video_to_color(frame((128, 128, 128)), 1 / 24, {})
+assert min(r, g, b) > 240, f"grey scene should be white: {(r, g, b)}"
+dark = video_to_color(frame((10, 10, 40)), 1 / 24, {})[3]
+bright = video_to_color(frame((240, 240, 200)), 1 / 24, {})[3]
+assert dark < 30 and bright > 90, f"dimming should follow the picture: {dark} {bright}"
+# small changes glide, a scene cut snaps
+st = {}
+video_to_color(frame((0, 0, 200)), 1 / 24, st)
+r, _, b, _ = video_to_color(frame((20, 0, 200)), 1 / 24, st)
+assert not st["cut"]
+r, _, b, _ = video_to_color(frame((220, 0, 0)), 1 / 24, st)
+assert st["cut"] and r > 200 and b < 20, f"scene cut should snap: {(r, b)}"
+
+
+# light packets: events at once, the rest rate-limited, `at` held back
+class FakeSender:
+    def __init__(self):
+        self.sent = []
+
+    def set_color(self, *pkt):
+        self.sent.append(pkt)
+
+
+fs = FakeSender()
+lo = LightOut(fs)
+lo.push((255, 0, 0, 50), None, 10.0)
+lo.push((0, 255, 0, 50), None, 10.01)  # too soon after the last send
+assert fs.sent == [(255, 0, 0, 50)], fs.sent
+lo.push((0, 0, 255, 100), "drop", 10.02)  # events skip the rate limit, x2
+assert fs.sent[1:] == [(0, 0, 255, 100)] * 2, fs.sent
+lo.push((9, 9, 9, 20), "beat", 10.03, at=10.2)
+lo.flush(10.1)
+assert len(fs.sent) == 3, "held packet went out early"
+lo.flush(10.2)
+assert fs.sent[-1] == (9, 9, 9, 20), fs.sent
+print("media checks passed")
