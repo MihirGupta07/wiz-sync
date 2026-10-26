@@ -47,3 +47,31 @@ jobs:
         with:
           name: wiz-sync-portable
           path: dist/wiz-sync/
+
+  # pushing a vX.Y.Z tag publishes the installer as a GitHub release, with
+  # packaging/release-notes.md as the notes and the installer's SHA256
+  release:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: WiZSync-Setup
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          exe="dist/WiZSync-Setup-$ver.exe"
+          test -f "$exe" || { echo "::error::$exe not built: tag doesn't match AppVersion in packaging/wiz-sync.iss"; exit 1; }
+          sha=$(sha256sum "$exe" | cut -d' ' -f1 | tr a-f A-F)
+          { cat packaging/release-notes.md; echo; echo "SHA256: \`$sha\`"; } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$exe" --repo "$GITHUB_REPOSITORY" \
+            --title "WiZ Sync $ver" --notes-file notes.md

@@ -1,7 +1,7 @@
 ; Inno Setup script: wraps the PyInstaller one-folder build into an installer.
 ; Build: iscc packaging\wiz-sync.iss  ->  dist\WiZSync-Setup-<ver>.exe
 ; Per-user install (no admin prompt); WinGet runs it with /VERYSILENT.
-#define AppVersion "1.0.1"
+#define AppVersion "1.1.0"
 
 [Setup]
 AppId={{6F1C2B9E-4D7A-4E7B-9C3A-5B2E8D1F0A42}

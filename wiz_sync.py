@@ -24,7 +24,7 @@ from tkinter import filedialog, ttk
 import numpy as np
 import pyaudiowpatch as pyaudio
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 WIZ_PORT = 38899
 # saved lights + debug log: next to the script when run from source; when
 # installed, in %LOCALAPPDATA%\WiZ Sync (the install folder may be read-only)
